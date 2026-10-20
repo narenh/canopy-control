@@ -5,4 +5,6 @@ services:
     ports: ["8000:8000"]
     environment:
       CAPTION_LANG: en
+      CANOPY_ACCOUNT_URL: ${CANOPY_ACCOUNT_URL:-https://account.canopysf.com}
+      CANOPY_ACCOUNT_KEY: ${CANOPY_ACCOUNT_KEY}  # required; the server refuses to start without it
     volumes: ["./data:/data"]

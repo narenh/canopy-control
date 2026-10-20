@@ -1,36 +1,53 @@
-"""yt-speed: hold YouTube Lounge sessions to one or more TVs and expose a tiny HTTP API.
+"""yt-speed: hold YouTube Lounge sessions to TVs, per Canopy Account, and expose a tiny HTTP API.
 
-GET    /                          - web UI
-GET    /devices                   - paired TVs with connection/playback state
+Every route needs `Authorization: Bearer <Canopy session token>` (the iOS app's sign-in). Each
+person sees and controls only the TVs they paired; two people can pair the same TV, each with
+their own Lounge session. Up to MAX_DEVICES TVs per person. There is no web UI.
+
+GET    /devices                   - the caller's TVs with connection/playback state
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
 DELETE /devices/{id}              - forget a TV
 POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
+
+Errors are JSON {"detail": "<sentence>"}, plus "reason" for: 401 signed_out, 403 email_unverified,
+503 account_unreachable, 409 too_many_devices.
+
+Env: CANOPY_ACCOUNT_KEY (required; the site key from the Account Manager's Sites tab),
+CANOPY_ACCOUNT_URL (default https://account.canopysf.com), DATA_DIR (default /data),
+CAPTION_LANG (default en).
 """
 import asyncio, json, logging, os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pyytlounge import YtLoungeApi, EventListener
 from pyytlounge.models import State
 
+import canopy_account
+
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
-LEGACY_AUTH = DATA / "auth.json"  # single-TV file from earlier versions
+LEGACY_AUTH = DATA / "auth.json"  # single-TV file from earlier versions, no owner: ignored
 CAPTION_LANG = os.environ.get("CAPTION_LANG", "en")
 CAPTION_WAIT = 3.0  # seconds to wait for the TV to report a caption change
 SPEEDS = {1.0, 1.25, 1.5, 1.75, 2.0}
+MAX_DEVICES = 10  # TVs per person
+CANOPY_ACCOUNT_URL = (os.environ.get("CANOPY_ACCOUNT_URL") or "").strip() or canopy_account.DEFAULT_URL
+CANOPY_ACCOUNT_KEY = (os.environ.get("CANOPY_ACCOUNT_KEY") or "").strip()
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
+canopy = canopy_account.CanopyAccount(CANOPY_ACCOUNT_URL, CANOPY_ACCOUNT_KEY) if CANOPY_ACCOUNT_KEY else None
 
 
 class Device(EventListener):
     """One paired TV: its Lounge session, reconnect loop, and last-known playback state."""
 
-    def __init__(self, name: str = "TV"):
+    def __init__(self, owner: str, name: str = "TV"):
+        self.owner = owner  # Canopy person id of whoever paired it
         self.name = name
         self.api = YtLoungeApi("Speed Remote", self)
         self.task: asyncio.Task | None = None
@@ -147,14 +164,15 @@ class Device(EventListener):
                 "video_id": self.video_id, "speed": self.speed, "captions": self.captions}
 
 
-devices: dict[str, Device] = {}
+devices: dict[tuple[str, str], Device] = {}  # (owner, screen_id) -> Device
 
 
 def save_devices():
     DATA.mkdir(parents=True, exist_ok=True)
     # api.store_auth_state() writes a format load_auth_state() rejects (pyytlounge 3.4 bug)
     DEVICES_FILE.write_text(json.dumps(
-        [{"name": d.name, "auth": d.api.auth.serialize()} for d in devices.values()], indent=1))
+        [{"owner": d.owner, "name": d.name, "auth": d.api.auth.serialize()} for d in devices.values()],
+        indent=1))
 
 
 def _normalize_auth(data: dict) -> dict:
@@ -165,41 +183,88 @@ def _normalize_auth(data: dict) -> dict:
             "refreshToken": data.get("refresh_token"), "expiry": None}
 
 
-def load_devices() -> list[Device]:
-    if DEVICES_FILE.exists():
-        entries = json.loads(DEVICES_FILE.read_text())
-    elif LEGACY_AUTH.exists():
-        entries = [{"name": "TV", "auth": json.loads(LEGACY_AUTH.read_text())}]
-    else:
-        entries = []
-    out = []
+def load_devices() -> tuple[list[Device], int]:
+    """The saved TVs, and how many ownerless (pre-accounts) entries were dropped."""
+    entries = json.loads(DEVICES_FILE.read_text()) if DEVICES_FILE.exists() else []
+    if not DEVICES_FILE.exists() and LEGACY_AUTH.exists():
+        log.warning("ignoring %s from before Canopy Accounts: re-pair the TV from the app", LEGACY_AUTH)
+    out, dropped = [], 0
     for entry in entries:
-        d = Device(entry.get("name", "TV"))
+        owner = entry.get("owner")
+        if not isinstance(owner, str) or not owner:
+            dropped += 1
+            continue
+        d = Device(owner, entry.get("name", "TV"))
         try:
             d.api.load_auth_state(_normalize_auth(entry["auth"]))
             out.append(d)
         except Exception as ex:
             log.warning("skipping unreadable device entry (re-pair needed): %s", ex)
-    return out
+    if dropped:
+        log.warning("dropped %d TV(s) paired before Canopy Accounts (no owner): re-pair them from the app",
+                    dropped)
+    return out, dropped
 
 
 @asynccontextmanager
 async def lifespan(_):
-    for d in load_devices():
-        devices[d.id] = d
+    if canopy is None:
+        log.critical("CANOPY_ACCOUNT_KEY is not set: refusing to start. Make a site in the Account "
+                     "Manager's Sites tab and set its key as CANOPY_ACCOUNT_KEY.")
+        raise RuntimeError("CANOPY_ACCOUNT_KEY is not set")
+    log.info("Canopy Accounts at %s", canopy.base)
+    loaded, dropped = load_devices()
+    for d in loaded:
+        devices[(d.owner, d.id)] = d
+    if dropped:
+        save_devices()  # rewrite without the ownerless entries
+    for d in devices.values():
         await d.start()
-    if devices and not DEVICES_FILE.exists():
-        save_devices()  # migrate legacy auth.json
     yield
     for d in devices.values():
         await d.stop()
+    await canopy.close()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def get(device_id: str, need_video=False) -> Device:
-    d = devices.get(device_id)
+class ApiError(HTTPException):
+    """An HTTPException that also says why, as a machine-readable `reason`."""
+
+    def __init__(self, status: int, detail: str, reason: str, headers: dict | None = None):
+        super().__init__(status, detail, headers)
+        self.reason = reason
+
+
+@app.exception_handler(ApiError)
+async def api_error(_: Request, ex: ApiError):
+    return JSONResponse({"detail": ex.detail, "reason": ex.reason}, ex.status_code, headers=ex.headers)
+
+
+async def require_person(request: Request) -> dict:
+    """The signed-in Canopy person calling, from `Authorization: Bearer <token>`. Fails closed."""
+    signed_out = ApiError(401, "Sign in with your Canopy Account.", "signed_out", {"WWW-Authenticate": "Bearer"})
+    token = canopy_account.read_token(request.headers.get("authorization"))
+    if not token:
+        raise signed_out
+    if canopy is None:  # only if started without the lifespan check
+        raise ApiError(503, "Canopy Accounts isn't set up on this server.", "account_unreachable")
+    try:
+        answer = await canopy.who_is(token)
+    except canopy_account.Unreachable:
+        raise ApiError(503, "Canopy Accounts could not be reached. Try again in a minute.",
+                       "account_unreachable")
+    person = answer["person"]
+    if answer["unverified"] or (person and person.get("emailVerified") is False):
+        raise ApiError(403, "Confirm your email with Canopy Accounts first.", "email_unverified")
+    if not person:
+        raise signed_out
+    return person
+
+
+def get(owner: str, device_id: str, need_video=False) -> Device:
+    d = devices.get((owner, device_id))
     if not d:
         raise HTTPException(404, "unknown device")
     if not d.api.connected():
@@ -214,29 +279,37 @@ class Pair(BaseModel):
 
 
 @app.get("/devices")
-async def list_devices():
-    return [d.info() for d in devices.values()]
+async def list_devices(person: dict = Depends(require_person)):
+    return [d.info() for d in devices.values() if d.owner == person["id"]]
 
 
 @app.post("/pair")
-async def pair(body: Pair):
-    d = Device()
+async def pair(body: Pair, person: dict = Depends(require_person)):
+    owner = person["id"]
+    d = Device(owner)
     await d.api.__aenter__()
     if not await d.api.pair(body.code.replace(" ", "")):
         await d.api.close()
         raise HTTPException(400, "pairing failed")
     d.name = d.api.screen_name or "TV"
-    if old := devices.pop(d.id, None):  # re-pairing the same TV replaces it
+    key = (owner, d.id)
+    # Checked after pairing (only then is the TV known), so re-pairing a TV at the limit works.
+    # No await between this check and the insert, so concurrent pairs can't overshoot.
+    if key not in devices and sum(x.owner == owner for x in devices.values()) >= MAX_DEVICES:
+        await d.api.close()
+        raise ApiError(409, f"You can pair up to {MAX_DEVICES} TVs. Remove one first.", "too_many_devices")
+    old = devices.get(key)  # re-pairing the same TV replaces this person's entry
+    devices[key] = d
+    if old:
         await old.stop()
-    devices[d.id] = d
     d.task = asyncio.create_task(d._loop())
     save_devices()
     return d.info()
 
 
 @app.delete("/devices/{device_id}")
-async def remove(device_id: str):
-    d = devices.pop(device_id, None)
+async def remove(device_id: str, person: dict = Depends(require_person)):
+    d = devices.pop((person["id"], device_id), None)
     if not d:
         raise HTTPException(404, "unknown device")
     await d.stop()
@@ -245,10 +318,10 @@ async def remove(device_id: str):
 
 
 @app.post("/devices/{device_id}/speed/{speed}")
-async def set_speed(device_id: str, speed: float):
+async def set_speed(device_id: str, speed: float, person: dict = Depends(require_person)):
     if speed not in SPEEDS:
         raise HTTPException(400, f"speed must be one of {sorted(SPEEDS)}")
-    d = get(device_id)
+    d = get(person["id"], device_id)
     await d.set_speed(speed)
     if d.video_id:
         await d.set_captions(speed > 1)
@@ -258,18 +331,13 @@ async def set_speed(device_id: str, speed: float):
 
 
 @app.post("/devices/{device_id}/captions/{mode}")
-async def set_captions(device_id: str, mode: str):
+async def set_captions(device_id: str, mode: str, person: dict = Depends(require_person)):
     if mode not in ("on", "off"):
         raise HTTPException(400, "mode must be on or off")
-    d = get(device_id, need_video=True)
+    d = get(person["id"], device_id, need_video=True)
     await d.set_captions(mode == "on")
     if d.captions != (mode == "on"):
         hint = f" (does this video have '{CAPTION_LANG}' captions?)" if mode == "on" else ""
         # not 502: Cloudflare replaces 502 bodies with its own page, hiding the detail
         raise HTTPException(409, f"{d.name} didn't turn captions {mode}{hint}")
     return d.info()
-
-
-@app.get("/")
-async def ui():
-    return FileResponse(Path(__file__).with_name("index.html"))
