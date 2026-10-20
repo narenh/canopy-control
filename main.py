@@ -1,5 +1,6 @@
 """yt-speed: hold a YouTube Lounge session to one TV and expose a tiny HTTP API.
 
+POST /captions/{on|off}     - manual caption toggle
 POST /pair {"code": "..."}  - one-time pairing with the TV's "Link with TV code"
 POST /speed/{x}             - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
 GET  /                     - web UI
@@ -24,6 +25,7 @@ logging.basicConfig(level=logging.INFO)
 class State(EventListener):
     video_id: str | None = None
     speed: float = 1.0
+    captions: bool = False
 
     async def now_playing_changed(self, e):
         if e.video_id:
@@ -31,6 +33,9 @@ class State(EventListener):
 
     async def playback_speed_changed(self, e):
         self.speed = e.playback_speed
+
+    async def subtitles_track_changed(self, e):
+        self.captions = bool(e.language_code)
 
 
 state = State()
@@ -96,7 +101,21 @@ async def set_speed(speed: float):
     await api.set_playback_speed(speed)
     if state.video_id:
         await api.set_closed_captions(CAPTION_LANG if speed > 1 else None, state.video_id)
+        state.captions = speed > 1
     return {"speed": speed, "captions": speed > 1, "video_id": state.video_id}
+
+
+@app.post("/captions/{mode}")
+async def set_captions(mode: str):
+    if mode not in ("on", "off"):
+        raise HTTPException(400, "mode must be on or off")
+    if not api.connected():
+        raise HTTPException(503, "not connected (is YouTube open on the TV?)")
+    if not state.video_id:
+        raise HTTPException(409, "no video playing")
+    await api.set_closed_captions(CAPTION_LANG if mode == "on" else None, state.video_id)
+    state.captions = mode == "on"
+    return {"captions": mode == "on"}
 
 
 @app.get("/status")
@@ -106,6 +125,7 @@ async def status():
         "connected": api.connected(),
         "video_id": state.video_id,
         "speed": state.speed,
+        "captions": state.captions,
     }
 
 

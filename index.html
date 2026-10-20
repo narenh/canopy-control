@@ -9,6 +9,8 @@
   #val { font-size: 6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
   input[type=range] { width: 100%; height: 3rem; accent-color: #e33; }
   #ticks { display: flex; justify-content: space-between; opacity: .6; }
+  #cc { display: flex; align-items: center; justify-content: center; gap: .75rem; margin-top: 2rem; font-size: 1.3rem; }
+  #cc input { width: 1.8rem; height: 1.8rem; accent-color: #e33; }
   #msg { min-height: 1.5em; opacity: .7; margin-top: 1.5rem; }
   #pair { display: none; margin-top: 2rem; gap: .5rem; justify-content: center; }
   #pair input, #pair button { font-size: 1.1rem; padding: .5rem; }
@@ -17,6 +19,7 @@
   <div id="val">1×</div>
   <input id="s" type="range" min="0" max="4" step="1" value="0">
   <div id="ticks"><span>1</span><span>1.25</span><span>1.5</span><span>1.75</span><span>2</span></div>
+  <label id="cc"><input id="ccbox" type="checkbox"> Captions</label>
   <div id="msg"></div>
   <form id="pair"><input id="code" placeholder="TV link code" inputmode="numeric"><button>Pair</button></form>
 </main>
@@ -29,6 +32,7 @@ async function status() {
   $('pair').style.display = r.paired ? 'none' : 'flex';
   $('msg').textContent = !r.paired ? 'Not paired' : r.connected ? '' : 'Waiting for YouTube on the TV…';
   const i = S.indexOf(r.speed);
+  if (document.activeElement !== $('ccbox')) $('ccbox').checked = !!r.captions;
   if (i >= 0 && document.activeElement !== $('s')) { $('s').value = sent = i; show(i); }
 }
 $('s').oninput = e => show(+e.target.value);
@@ -36,6 +40,10 @@ $('s').onchange = async e => {
   const i = +e.target.value; if (i === sent) return; sent = i;
   const r = await fetch('speed/' + S[i], { method: 'POST' });
   $('msg').textContent = r.ok ? '' : (await r.json()).detail;
+};
+$('ccbox').onchange = async e => {
+  const r = await fetch('captions/' + (e.target.checked ? 'on' : 'off'), { method: 'POST' });
+  if (!r.ok) { e.target.checked = !e.target.checked; $('msg').textContent = (await r.json()).detail; }
 };
 $('pair').onsubmit = async e => {
   e.preventDefault();

@@ -4,6 +4,7 @@ Self-hosted playback-speed remote for YouTube on a TV. Uses the unofficial YouTu
 
 - `/` — one-page web UI: slider 1x / 1.25 / 1.5 / 1.75 / 2x
 - `POST /speed/{x}` — sets speed; captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`)
+- `POST /captions/{on|off}` — manual caption toggle (checkbox under the slider)
 - `POST /pair {"code": "..."}` — pair with YouTube → Settings → Link with TV code
 - `GET /status`
 
