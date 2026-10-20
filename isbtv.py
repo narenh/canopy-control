@@ -59,6 +59,12 @@ def _number(env, key: str, default: float) -> int | float:
     return int(n) if n == int(n) else n
 
 
+def label(screen_id: str) -> str:
+    """The name iSponsorBlockTV gets for a TV: fixed per screen id (it only shows in its logs). Not
+    the TV's display name, because every config change restarts iSponsorBlockTV for everyone."""
+    return "TV " + screen_id[:8]
+
+
 class Config:
     def __init__(self, path: Path, hidden: set[str], settings: dict):
         self.path = path
@@ -67,7 +73,8 @@ class Config:
 
     @staticmethod
     def devices(tvs) -> list[dict]:
-        """iSponsorBlockTV's devices from (screen_id, name) pairs: one per screen id, first name wins."""
+        """iSponsorBlockTV's devices from (screen_id, name) pairs: one per screen id, first name wins.
+        Callers pass label(screen_id) as the name, so renaming a TV never rewrites the file."""
         out = {}
         for screen_id, name in tvs:
             if screen_id and screen_id not in out:

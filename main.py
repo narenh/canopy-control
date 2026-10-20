@@ -318,7 +318,7 @@ def render_isbtv():
     if ISBTV is None:
         return
     try:
-        tvs = [(d.id, d.display_name) for d in devices.values() if d.skip_sponsors and skip_allowed(d.owner)]
+        tvs = [(d.id, isbtv.label(d.id)) for d in devices.values() if d.skip_sponsors and skip_allowed(d.owner)]
         if ISBTV.write(tvs):
             log.info("iSponsorBlockTV config: %d TV(s) skipping sponsors", len(ISBTV.devices(tvs)))
     except Exception:
@@ -483,6 +483,8 @@ async def pair(body: Pair, person: dict = Depends(require_person)):
         d.custom_name = old.custom_name  # but keeps their name for it
         d.skip_sponsors = old.skip_sponsors  # and their skip choice
         await old.stop()
+    else:
+        d.skip_sponsors = skip_allowed(owner)  # on by default for a new TV; turning it off is deliberate
     d.task = asyncio.create_task(d._loop())
     save_devices()
     return d.info()

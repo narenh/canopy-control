@@ -178,7 +178,7 @@ with TestClient(main.app) as c:
     check("rendered at startup (directory created)", CONF.exists())
     cfg = conf()
     check("config is exactly the defaults plus devices", cfg == {"devices": [
-        {"screen_id": "scr-LIV", "name": "Living", "offset": 0}], **DEFAULTS}, cfg)
+        {"screen_id": "scr-LIV", "name": "TV scr-LIV", "offset": 0}], **DEFAULTS}, cfg)
     check("config keys are iSponsorBlockTV's (the template's)", set(cfg) == UPSTREAM_KEYS, set(cfg) ^ UPSTREAM_KEYS)
     check("upstream would accept it", upstream_accepts(cfg))
     check("hidden person's stored skip_sponsors left out at startup", "scr-HID" not in [d["screen_id"] for d in devs()])
@@ -210,23 +210,22 @@ with TestClient(main.app) as c:
           main.devices[(HID, "scr-HX")].skip_sponsors is False and ino() == before)
     check("hidden person: unknown TV is still 404", patch("scr-nope", {"skip_sponsors": True}, "H").status_code == 404)
 
-    # --- B turns it on, for a new TV and the TV A also has
+    # --- pairing turns it on by default, for a new TV and the TV A also has
     r = c.post("/pair", json={"code": "BED"}, headers=H("B"))
-    check("new TV: skip_sponsors false", r.status_code == 200 and r.json()["skip_sponsors"] is False, r.text)
+    check("new TV: skip_sponsors on by default", r.status_code == 200 and r.json()["skip_sponsors"] is True, r.text)
+    check("stored as skip_sponsors true", next(e for e in saved() if e["owner"] == B and e["auth"]["screenId"] == "scr-BED")
+          ["skip_sponsors"] is True)
+    check("pairing added B's TV to the config", [d["screen_id"] for d in devs()] == ["scr-LIV", "scr-BED"], devs())
     r = c.post("/pair", json={"code": "LIV"}, headers=H("B"))
-    check("B pairs A's TV too: off for B", r.json()["skip_sponsors"] is False and tvs("A")["scr-LIV"]["skip_sponsors"] is True)
-    check("pairing a TV with skip off didn't rewrite the config", ino() == before)
+    check("B pairs A's TV too: on for B as well", r.json()["skip_sponsors"] is True and tvs("A")["scr-LIV"]["skip_sponsors"] is True)
     r = patch("scr-BED", {"skip_sponsors": True}, "B")
     check("PATCH skip_sponsors alone returns the TV", r.status_code == 200 and r.json()["skip_sponsors"] is True
           and set(r.json()) == INFO_KEYS | {"skip_sponsors"} and r.json()["name"] == "TV BED", r.text)
-    check("stored as skip_sponsors true", next(e for e in saved() if e["owner"] == B and e["auth"]["screenId"] == "scr-BED")
-          ["skip_sponsors"] is True)
-    check("B's TV added to the config", [d["screen_id"] for d in devs()] == ["scr-LIV", "scr-BED"], devs())
     r = patch("scr-LIV", {"name": "Lounge", "skip_sponsors": True}, "B")
     check("PATCH name and skip_sponsors together", r.status_code == 200 and r.json()["name"] == "Lounge"
           and r.json()["skip_sponsors"] is True, r.text)
-    check("union dedups the shared TV; first owner's name wins", devs() == [
-        {"screen_id": "scr-LIV", "name": "Living", "offset": 0}, {"screen_id": "scr-BED", "name": "TV BED", "offset": 0}], devs())
+    check("union dedups the shared TV; labelled by screen id, not name", devs() == [
+        {"screen_id": "scr-LIV", "name": "TV scr-LIV", "offset": 0}, {"screen_id": "scr-BED", "name": "TV scr-BED", "offset": 0}], devs())
 
     # --- rewritten only on a change
     before = ino()
@@ -236,13 +235,14 @@ with TestClient(main.app) as c:
     c.post("/pair", json={"code": "HY"}, headers=H("H"))
     check("same content: not rewritten (inode and mtime unchanged)", ino() == before)
     patch("scr-LIV", {"name": "Living room"}, "A")
-    check("the used name changes: rewritten", devs()[0]["name"] == "Living room" and ino() != before, devs())
+    patch("scr-LIV", {"name": None}, "A")
+    check("renaming never rewrites it (so never restarts iSponsorBlockTV)", ino() == before)
 
     # --- turning it off / removing
     patch("scr-LIV", {"skip_sponsors": False}, "A")
-    check("A off, B still on: the TV stays, named by B now", devs() == [
-        {"screen_id": "scr-BED", "name": "TV BED", "offset": 0},
-        {"screen_id": "scr-LIV", "name": "Lounge 2", "offset": 0}], devs())
+    check("A off, B still on: the TV stays", devs() == [
+        {"screen_id": "scr-BED", "name": "TV scr-BED", "offset": 0},
+        {"screen_id": "scr-LIV", "name": "TV scr-LIV", "offset": 0}], devs())
     check("A's entry no longer stores it", "skip_sponsors" not in next(
         e for e in saved() if e["owner"] == A and e["auth"]["screenId"] == "scr-LIV"))
     check("A sees false", tvs("A")["scr-LIV"]["skip_sponsors"] is False)
