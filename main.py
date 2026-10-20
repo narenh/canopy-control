@@ -39,6 +39,7 @@ class Device(EventListener):
         self.captions = False  # only ever set from the TV's onSubtitlesTrackChanged
         self.want_captions: bool | None = None  # last control wins: slider (on above 1x) or toggle
         self._captions_changed = asyncio.Event()
+        self._speed_changed = asyncio.Event()
         self._auto_captioned: str | None = None  # last video want_captions was applied to
 
     # --- events from the TV
@@ -54,6 +55,20 @@ class Device(EventListener):
 
     async def playback_speed_changed(self, e):
         self.speed = e.playback_speed
+        self._speed_changed.set()
+
+    async def set_speed(self, speed: float):
+        """Set the speed and, if it changes, wait for the TV to apply it: a caption command
+        sent while the TV is still changing speed gets dropped."""
+        changing = speed != self.speed
+        self._speed_changed.clear()
+        await self.api.set_playback_speed(speed)
+        if changing:
+            try:
+                await asyncio.wait_for(self._speed_changed.wait(), CAPTION_WAIT)
+            except asyncio.TimeoutError:
+                log.warning("%s: TV didn't report a speed change to %s", self.name, speed)
+        self.speed = speed  # callers render the response, even if the TV's event is late
 
     async def subtitles_track_changed(self, e):
         log.info("%s captions: video=%s lang=%r kind=%r", self.name, e.video_id, e.language_code, e.kind)
@@ -234,8 +249,7 @@ async def set_speed(device_id: str, speed: float):
     if speed not in SPEEDS:
         raise HTTPException(400, f"speed must be one of {sorted(SPEEDS)}")
     d = get(device_id)
-    await d.api.set_playback_speed(speed)
-    d.speed = speed  # don't wait for the TV's event; callers render the response
+    await d.set_speed(speed)
     if d.video_id:
         await d.set_captions(speed > 1)
     else:
