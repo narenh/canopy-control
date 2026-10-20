@@ -12,6 +12,13 @@ os.environ.setdefault("CANOPY_ACCOUNT_KEY", "cnp_test")
 import main  # noqa: E402
 
 main.CAPTION_WAIT = 0.1
+
+
+async def no_title(vid):  # never YouTube's oEmbed: d.video_id below looks like a real id
+    return None, None
+
+
+main.titles.fetch = no_title
 passed = 0
 
 

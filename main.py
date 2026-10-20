@@ -4,18 +4,28 @@ Every route needs `Authorization: Bearer <Canopy session token>` (the iOS app's 
 person sees and controls only the TVs they paired; two people can pair the same TV, each with
 their own Lounge session. Up to MAX_DEVICES TVs per person. There is no web UI.
 
-GET    /devices                   - the caller's TVs with connection/playback state
+GET    /devices                   - the caller's TVs with connection/playback state: {"id", "name",
+                                   "connected", "video_id", "title", "channel", "speed", "captions",
+                                   "skip_sponsors"?}, also what pair, PATCH, speed and captions return
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
 PATCH  /devices/{id} {"name": ..., "skip_sponsors": bool} - either or both: rename a TV (trimmed,
                                    1-40 chars; null or "" = the TV's own name), skip sponsors on it
 DELETE /devices/{id}              - forget a TV (ends Live Activities showing it)
-POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
+POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; with the caller's auto_captions on,
+                                   also captions on above 1, off at 1; off: only the speed
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
+GET    /me/settings               - the caller's settings: {"auto_captions": bool} (default true)
+PATCH  /me/settings {"auto_captions": bool} - change them (strict bool; {} is 422); returns all of
+                                   them. Stored per person in settings.json, only non-defaults.
 PUT    /installs/{uuid}           - an app install's Live Activity tokens (see below)
 DELETE /installs/{uuid}           - forget an install (the app's sign-out)
 
 Errors are JSON {"detail": "<sentence>"}, plus "reason" for: 401 signed_out, 403 email_unverified,
 503 account_unreachable, 409 too_many_devices, 403 skip_not_allowed.
+
+Titles (oembed.py): "title" and "channel" are the TV's current video's, from YouTube's public oEmbed
+endpoint, fetched in the background when the video changes and cached per video id; null until
+fetched, with no video, or when oEmbed has none (private/unembeddable; retried after 10 min).
 
 Skip sponsors (an iSponsorBlockTV container next to this one, isbtv.py): on when ISPONSORBLOCKTV_CONFIG
 is set. Each TV in GET /devices etc. then has "skip_sponsors", except for SKIP_HIDDEN_PERSON_IDS (and
@@ -37,7 +47,7 @@ CANOPY_APNS_URL (default https://apns.canopysf.com), CANOPY_CONTROL_BUNDLE_ID (d
 com.canopysf.CanopyControl); for skip sponsors, ISPONSORBLOCKTV_CONFIG, SKIP_HIDDEN_PERSON_IDS and the
 iSponsorBlockTV settings in isbtv.py.
 """
-import asyncio, json, logging, os, time
+import asyncio, json, logging, os, tempfile, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -51,9 +61,11 @@ import canopy_account
 from lounge import LoungeApi
 import isbtv
 import live_push
+import oembed
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
+SETTINGS_FILE = DATA / "settings.json"
 LEGACY_AUTH = DATA / "auth.json"  # single-TV file from earlier versions, no owner: ignored
 CAPTION_LANG = os.environ.get("CAPTION_LANG", "en")
 CAPTION_WAIT = 1.5  # seconds to wait for the TV to confirm a speed or caption change (it takes well under 1)
@@ -75,6 +87,7 @@ log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
 ISBTV = isbtv.from_env(os.environ)  # None: skip sponsors is off
 canopy = canopy_account.CanopyAccount(CANOPY_ACCOUNT_URL, CANOPY_ACCOUNT_KEY) if CANOPY_ACCOUNT_KEY else None
+titles = oembed.Titles()  # the current video's title and channel, fetched in the background
 
 
 class Device(EventListener):
@@ -91,7 +104,7 @@ class Device(EventListener):
             self._log_raw_events()
         self.task: asyncio.Task | None = None
         self._resubscribed_at = float("-inf")
-        self.video_id: str | None = None
+        self._video_id: str | None = None
         self.speed = 1.0
         self.captions = False  # only ever set from the TV's onSubtitlesTrackChanged
         self.want_captions: bool | None = None  # last control wins: slider (on above 1x) or toggle
@@ -103,6 +116,16 @@ class Device(EventListener):
         self._playing = False
         self._played_video: str | None = None  # last video reported Playing
         self._stopped_at = 0.0  # when it last stopped being Playing (live.clock time)
+
+    @property
+    def video_id(self) -> str | None:
+        return self._video_id
+
+    @video_id.setter
+    def video_id(self, v: str | None):
+        if v != self._video_id:
+            titles.want(v)  # in the background: info() shows the title once it's known
+        self._video_id = v
 
     # --- events from the TV
     async def now_playing_changed(self, e):
@@ -288,8 +311,11 @@ class Device(EventListener):
             await asyncio.sleep(RECONNECT_S)  # TV off / app closed: retry quietly
 
     def info(self) -> dict:
+        titles.want(self.video_id)  # no-op unless it's not cached yet or a failure has expired
+        title, channel = titles.get(self.video_id)
         out = {"id": self.id, "name": self.display_name, "connected": self.api.connected(),
-               "video_id": self.video_id, "speed": self.speed, "captions": self.captions}
+               "video_id": self.video_id, "title": title, "channel": channel,
+               "speed": self.speed, "captions": self.captions}
         if skip_allowed(self.owner):  # the app shows the toggle only when this is there
             out["skip_sponsors"] = self.skip_sponsors
         return out
@@ -328,6 +354,54 @@ def save_devices():
           "auth": d.api.auth.serialize()} for d in devices.values()],
         indent=1))
     render_isbtv()
+
+
+DEFAULT_SETTINGS = {"auto_captions": True}
+settings: dict[str, dict] = {}  # person id -> the settings they changed from DEFAULT_SETTINGS
+
+
+def person_settings(person_id: str) -> dict:
+    return {**DEFAULT_SETTINGS, **settings.get(person_id, {})}
+
+
+def write_atomic(path: Path, text: str):
+    """A temp file in the same directory, then os.replace: a crash never leaves half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def save_settings():
+    write_atomic(SETTINGS_FILE, json.dumps(settings, indent=1, sort_keys=True))
+
+
+def load_settings():
+    """settings.json: {person id: {setting: value}}, only values that differ from the defaults.
+    Anything unreadable is skipped (that person gets the defaults back)."""
+    settings.clear()
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text()) if SETTINGS_FILE.exists() else {}
+    except Exception as ex:
+        log.warning("ignoring unreadable %s: %s", SETTINGS_FILE, ex)
+        raw = {}
+    for pid, values in (raw.items() if isinstance(raw, dict) else ()):
+        if not isinstance(pid, str) or not pid or not isinstance(values, dict):
+            continue
+        kept = {k: v for k, v in values.items()
+                if k in DEFAULT_SETTINGS and type(v) is type(DEFAULT_SETTINGS[k]) and v != DEFAULT_SETTINGS[k]}
+        if kept:
+            settings[pid] = kept
 
 
 def render_isbtv():
@@ -408,6 +482,7 @@ async def lifespan(_):
         log.info("ISPONSORBLOCKTV_CONFIG is not set: skip sponsors is off")
     check_writable(DATA)
     live.load()
+    load_settings()
     loaded, dropped = load_devices()
     for d in loaded:
         devices[(d.owner, d.id)] = d
@@ -420,6 +495,7 @@ async def lifespan(_):
     for d in devices.values():
         await d.stop()
     await live.close()
+    await titles.close()
     await canopy.close()
 
 
@@ -561,11 +637,15 @@ async def set_speed(device_id: str, speed: float, person: dict = Depends(require
     if speed not in SPEEDS:
         raise HTTPException(400, f"speed must be one of {sorted(SPEEDS)}")
     d = get(person["id"], device_id)
+    # The sender's setting (d is theirs). Off: only the speed changes; no caption command, and
+    # want_captions stays as the last control (the toggle, or the slider while it was on) left it.
+    auto = person_settings(person["id"])["auto_captions"]
     await d.set_speed(speed)
-    if d.video_id:
-        await d.set_captions(speed > 1)
-    else:
-        d.want_captions = speed > 1  # applied when the next video starts
+    if auto:
+        if d.video_id:
+            await d.set_captions(speed > 1)
+        else:
+            d.want_captions = speed > 1  # applied when the next video starts
     return d.info()
 
 
@@ -580,6 +660,45 @@ async def set_captions(device_id: str, mode: str, person: dict = Depends(require
         # not 502: Cloudflare replaces 502 bodies with its own page, hiding the detail
         raise HTTPException(409, f"{d.display_name} didn't turn captions {mode}{hint}")
     return d.info()
+
+
+class SettingsPatch(BaseModel):
+    auto_captions: StrictBool | None = None  # true or false; null is refused below
+
+    @model_validator(mode="after")
+    def _some(self):
+        if not self.model_fields_set:
+            raise ValueError("send auto_captions")
+        if self.auto_captions is None:
+            raise ValueError("auto_captions must be true or false")
+        return self
+
+
+@app.get("/me/settings")
+async def get_settings(person: dict = Depends(require_person)):
+    return person_settings(person["id"])
+
+
+@app.patch("/me/settings")
+async def patch_settings(body: SettingsPatch, person: dict = Depends(require_person)):
+    pid = person["id"]
+    new = {**person_settings(pid), **{k: getattr(body, k) for k in body.model_fields_set}}
+    changed = {k: v for k, v in new.items() if v != DEFAULT_SETTINGS[k]}
+    if changed != settings.get(pid, {}):
+        old = settings.get(pid)
+        if changed:
+            settings[pid] = changed
+        else:
+            settings.pop(pid, None)
+        try:
+            save_settings()
+        except BaseException:
+            if old is None:
+                settings.pop(pid, None)
+            else:
+                settings[pid] = old
+            raise
+    return person_settings(pid)
 
 
 class ActivityBody(BaseModel):

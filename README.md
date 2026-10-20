@@ -12,14 +12,16 @@ There is no web UI any more. `/docs` and `/openapi.json` are FastAPI's.
 
 ## API
 
-- `GET /devices` — your TVs: `[{"id", "name", "connected", "video_id", "speed", "captions", "skip_sponsors"?}]`. `skip_sponsors` (bool) is there only when you may use [skip sponsors](#skip-sponsors); the app shows the toggle only then. The same TV object comes back from `/pair`, `PATCH`, `/speed` and `/captions`.
+- `GET /devices` — your TVs: `[{"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "skip_sponsors"?}]`. `title` and `channel` (string or `null`) describe `video_id`: see [Video titles](#video-titles). `skip_sponsors` (bool) is there only when you may use [skip sponsors](#skip-sponsors); the app shows the toggle only then. The same TV object comes back from `/pair`, `PATCH`, `/speed` and `/captions`.
 - `POST /pair {"code": "..."}` — add a TV (YouTube → Settings → Link with TV code); returns that TV. 400 `pairing failed`; 409 `too_many_devices` past 10. Re-pairing a TV you already have replaces it.
 - `PATCH /devices/{id} {"name": "...", "skip_sponsors": true|false}` — either field or both (neither: 422); returns that TV. Nothing changes if any part is refused.
   - `name`: rename the TV. Trimmed, 1–40 characters (400 otherwise); `null` or `""` goes back to the name the TV reports. The custom name is yours only, survives reconnects and re-pairing, and is what `GET /devices` and Live Activities show.
   - `skip_sponsors`: turn skipping sponsors on this TV on or off, for you (kept across re-pairing). A strict boolean (422 otherwise). 403 `skip_not_allowed` if you may not use it, or it's off on this server.
 - `DELETE /devices/{id}` — forget a TV: `{"removed": id}`. Live Activities showing it are ended.
-- `POST /devices/{id}/speed/{x}` — x in 1, 1.25, 1.5, 1.75, 2; captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`)
-- `POST /devices/{id}/captions/{on|off}` — manual caption toggle; 409 if the TV does not confirm the change. Whichever of slider/toggle was used last wins and is re-applied to each new video
+- `POST /devices/{id}/speed/{x}` — x in 1, 1.25, 1.5, 1.75, 2. With your `auto_captions` setting on (the default), also captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`). With it off, only the speed changes: no caption command, and the caption choice re-applied to new videos stays as it was.
+- `POST /devices/{id}/captions/{on|off}` — manual caption toggle, whatever `auto_captions` is; 409 if the TV does not confirm the change. Whichever of slider (while `auto_captions` is on) and toggle was used last wins and is re-applied to each new video
+- `GET /me/settings` — your settings: `{"auto_captions": true}` (the default).
+- `PATCH /me/settings {"auto_captions": true|false}` — change them; returns the full settings object. A strict boolean; `{}`, `null` or another type is 422. Stored per person in `settings.json` in `/data` (only values that differ from the defaults; written atomically). The setting is the caller's: on a TV two people paired, each person's speed requests follow their own.
 
 Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 
@@ -32,6 +34,16 @@ Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 | 403 | `skip_not_allowed` | `PATCH` with `skip_sponsors` by a hidden person, or with the feature off |
 
 Others (no `reason`): 404 `unknown device`, 404 `unknown install`, 503 `<TV> not connected (is YouTube open on it?)`, 409 `no video playing`, 409 `<TV> didn't turn captions on/off…`, 400 for a bad speed, mode or pairing code.
+
+## Video titles
+
+`title` and `channel` come from YouTube's public oEmbed endpoint (`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=<id>&format=json`, fields `title` and `author_name`; no key). `oembed.py`:
+
+- Fetched in the background when a TV's `video_id` changes (and when a TV is shown whose video isn't cached), never while answering a request: the response has whatever is cached, so both are `null` until the fetch is done, and when there's no video.
+- Only for ids matching `^[A-Za-z0-9_-]{11}$`. 5 s timeout. One fetch per id at a time.
+- Cached per video id in memory, the 500 most recently used.
+- A failure (e.g. 401/403/404 for a private or unembeddable video, a timeout) is logged once at INFO and cached as `null` for 10 minutes, then fetched again the next time the id is wanted.
+- Not part of the Live Activity content-state.
 
 ## Live Activities
 

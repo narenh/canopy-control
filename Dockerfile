@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py canopy_account.py live_push.py isbtv.py lounge.py ./
+COPY main.py canopy_account.py live_push.py isbtv.py lounge.py oembed.py ./
 # Not root. uid/gid 10001 is shared with the isponsorblocktv service (docker-compose.yml), which
 # reads the config.json this one writes into /isbtv. A named volume mounted on /data or /isbtv
 # starts out owned by this user, since the directories are.

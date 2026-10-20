@@ -388,7 +388,7 @@ with TestClient(main.app) as c:
     check("PATCH needs sign-in", c.patch("/devices/scr-BED", json={"name": "x"}).status_code == 401)
     r = patch("scr-BED", {"name": "  Bedroom  "}); drain(); b = bodies()
     check("rename trims and returns the TV", r.status_code == 200 and r.json()["name"] == "Bedroom"
-          and set(r.json()) == {"id", "name", "connected", "video_id", "speed", "captions"}, r.text)
+          and set(r.json()) == {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions"}, r.text)
     check("GET /devices shows the new name", next(x for x in c.get("/devices", headers=H("A")).json() if x["id"] == "scr-BED")["name"] == "Bedroom")
     check("devices.json keeps both names", saved_entry("scr-BED")["name"] == "TV BED" and saved_entry("scr-BED")["custom_name"] == "Bedroom")
     check("rename pushes to the activity showing that TV",
