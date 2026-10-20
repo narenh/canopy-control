@@ -37,7 +37,7 @@ CANOPY_APNS_URL (default https://apns.canopysf.com), CANOPY_CONTROL_BUNDLE_ID (d
 com.canopysf.CanopyControl); for skip sponsors, ISPONSORBLOCKTV_CONFIG, SKIP_HIDDEN_PERSON_IDS and the
 iSponsorBlockTV settings in isbtv.py.
 """
-import asyncio, json, logging, os
+import asyncio, json, logging, os, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -56,7 +56,8 @@ DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
 LEGACY_AUTH = DATA / "auth.json"  # single-TV file from earlier versions, no owner: ignored
 CAPTION_LANG = os.environ.get("CAPTION_LANG", "en")
-CAPTION_WAIT = 3.0  # seconds to wait for the TV to report a caption change
+CAPTION_WAIT = 1.5  # seconds to wait for the TV to confirm a speed or caption change (it takes well under 1)
+RESUBSCRIBE_GAP_S = 30  # at most one forced resubscribe per TV this often
 SPEEDS = {1.0, 1.25, 1.5, 1.75, 2.0}
 MAX_DEVICES = 10  # TVs per person
 MAX_NAME = 40  # characters in a TV name set from the app
@@ -89,6 +90,7 @@ class Device(EventListener):
         if LOG_LOUNGE_EVENTS:
             self._log_raw_events()
         self.task: asyncio.Task | None = None
+        self._resubscribed_at = float("-inf")
         self.video_id: str | None = None
         self.speed = 1.0
         self.captions = False  # only ever set from the TV's onSubtitlesTrackChanged
@@ -163,6 +165,7 @@ class Device(EventListener):
                 await asyncio.wait_for(self._speed_changed.wait(), CAPTION_WAIT)
             except asyncio.TimeoutError:
                 log.warning("%s: TV didn't report a speed change to %s", self.name, speed)
+                self._resubscribe()
         self.speed = speed  # callers render the response, even if the TV's event is late
         self._changed()
 
@@ -225,6 +228,7 @@ class Device(EventListener):
                 await asyncio.wait_for(self._captions_changed.wait(), CAPTION_WAIT)
             except asyncio.TimeoutError:
                 log.warning("%s: TV didn't report a caption change for %s", self.name, self.video_id)
+                self._resubscribe()
 
     # --- lifecycle
     @property
@@ -237,6 +241,19 @@ class Device(EventListener):
 
     async def start(self):
         await self.api.__aenter__()
+        self.task = asyncio.create_task(self._loop())
+
+    def _resubscribe(self):
+        """A command got no confirmation. The TV applies our commands even when its events stop
+        reaching us: YouTube sometimes lets a subscription go quiet a minute or more before it
+        ends the session, and every command then waits out CAPTION_WAIT. Start a fresh session
+        now instead of waiting for that (at most once per RESUBSCRIBE_GAP_S)."""
+        now = time.monotonic()
+        if now - self._resubscribed_at < RESUBSCRIBE_GAP_S or not self.task:
+            return
+        self._resubscribed_at = now
+        log.warning("%s: events stopped arriving; starting a fresh session", self.name)
+        self.task.cancel()
         self.task = asyncio.create_task(self._loop())
 
     async def stop(self):
