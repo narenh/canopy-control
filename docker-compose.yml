@@ -7,4 +7,6 @@ services:
       CAPTION_LANG: en
       CANOPY_ACCOUNT_URL: ${CANOPY_ACCOUNT_URL:-https://account.canopysf.com}
       CANOPY_ACCOUNT_KEY: ${CANOPY_ACCOUNT_KEY}  # required; the server refuses to start without it
+      CANOPY_APNS_URL: ${CANOPY_APNS_URL:-https://apns.canopysf.com}
+      CANOPY_APNS_KEY: ${CANOPY_APNS_KEY:-}  # optional; without it there are no Live Activity pushes
     volumes: ["./data:/data"]

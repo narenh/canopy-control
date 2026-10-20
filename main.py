@@ -6,16 +6,29 @@ their own Lounge session. Up to MAX_DEVICES TVs per person. There is no web UI.
 
 GET    /devices                   - the caller's TVs with connection/playback state
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
-DELETE /devices/{id}              - forget a TV
+PATCH  /devices/{id} {"name": ...} - rename a TV (trimmed, 1-40 chars); null or "" = the TV's own name
+DELETE /devices/{id}              - forget a TV (ends Live Activities showing it)
 POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
+PUT    /installs/{uuid}           - an app install's Live Activity tokens (see below)
+DELETE /installs/{uuid}           - forget an install (the app's sign-out)
 
 Errors are JSON {"detail": "<sentence>"}, plus "reason" for: 401 signed_out, 403 email_unverified,
 503 account_unreachable, 409 too_many_devices.
 
+Live Activities (Canopy Control, through the canopy-apns relay; live_push.py): PUT /installs/{uuid}
+takes {"environment": "sandbox"|"production", "push_to_start_token": hex, "activity": {"token":
+hex, "device_id": "<one of the caller's TVs>"}}, all optional, null clears. When one of a person's
+TVs starts playing (a new video, or the first Playing after the session connects or after 30 min
+without), each of their installs gets an update if its activity already shows that TV (and is
+under 8 h old), else a push-to-start (at most one per install and TV per 2 min). Speed, captions,
+connection and name changes go to the activities showing that TV, debounced 0.5 s.
+
 Env: CANOPY_ACCOUNT_KEY (required; the site key from the Account Manager's Sites tab),
 CANOPY_ACCOUNT_URL (default https://account.canopysf.com), DATA_DIR (default /data),
-CAPTION_LANG (default en).
+CAPTION_LANG (default en), CANOPY_APNS_KEY (this instance's relay key; unset = no pushes),
+CANOPY_APNS_URL (default https://apns.canopysf.com), CANOPY_CONTROL_BUNDLE_ID (default
+com.canopysf.CanopyControl).
 """
 import asyncio, json, logging, os
 from contextlib import asynccontextmanager
@@ -28,6 +41,7 @@ from pyytlounge import YtLoungeApi, EventListener
 from pyytlounge.models import State
 
 import canopy_account
+import live_push
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
@@ -36,8 +50,14 @@ CAPTION_LANG = os.environ.get("CAPTION_LANG", "en")
 CAPTION_WAIT = 3.0  # seconds to wait for the TV to report a caption change
 SPEEDS = {1.0, 1.25, 1.5, 1.75, 2.0}
 MAX_DEVICES = 10  # TVs per person
+MAX_NAME = 40  # characters in a TV name set from the app
 CANOPY_ACCOUNT_URL = (os.environ.get("CANOPY_ACCOUNT_URL") or "").strip() or canopy_account.DEFAULT_URL
 CANOPY_ACCOUNT_KEY = (os.environ.get("CANOPY_ACCOUNT_KEY") or "").strip()
+CANOPY_APNS_URL = (os.environ.get("CANOPY_APNS_URL") or "").strip() or live_push.DEFAULT_URL
+CANOPY_APNS_KEY = (os.environ.get("CANOPY_APNS_KEY") or "").strip()
+CANOPY_CONTROL_BUNDLE_ID = (os.environ.get("CANOPY_CONTROL_BUNDLE_ID") or "").strip() or live_push.DEFAULT_BUNDLE_ID
+RECONNECT_S = 10  # wait between Lounge connection attempts
+PLAY_IDLE_S = 30 * 60  # Playing again after this long without counts as starting to play
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
 canopy = canopy_account.CanopyAccount(CANOPY_ACCOUNT_URL, CANOPY_ACCOUNT_KEY) if CANOPY_ACCOUNT_KEY else None
@@ -46,9 +66,10 @@ canopy = canopy_account.CanopyAccount(CANOPY_ACCOUNT_URL, CANOPY_ACCOUNT_KEY) if
 class Device(EventListener):
     """One paired TV: its Lounge session, reconnect loop, and last-known playback state."""
 
-    def __init__(self, owner: str, name: str = "TV"):
+    def __init__(self, owner: str, name: str = "TV", custom_name: str | None = None):
         self.owner = owner  # Canopy person id of whoever paired it
-        self.name = name
+        self.name = name  # what the TV calls itself
+        self.custom_name = custom_name  # what its owner renamed it to, if they did
         self.api = YtLoungeApi("Speed Remote", self)
         self.task: asyncio.Task | None = None
         self.video_id: str | None = None
@@ -58,21 +79,56 @@ class Device(EventListener):
         self._captions_changed = asyncio.Event()
         self._speed_changed = asyncio.Event()
         self._auto_captioned: str | None = None  # last video want_captions was applied to
+        # for Live Activities: when this TV "starts playing" (see _note_state)
+        self._fresh = True  # no Playing seen since the session (re)connected
+        self._playing = False
+        self._played_video: str | None = None  # last video reported Playing
+        self._stopped_at = 0.0  # when it last stopped being Playing (live.clock time)
 
     # --- events from the TV
     async def now_playing_changed(self, e):
         if e.video_id:
             self.video_id = e.video_id
+        self._note_state(e.state)
         if e.state == State.Playing:
             await self._auto_caption()
 
     async def playback_state_changed(self, e):
+        self._note_state(e.state)
         if e.state == State.Playing:
             await self._auto_caption()
 
     async def playback_speed_changed(self, e):
         self.speed = e.playback_speed
         self._speed_changed.set()
+        self._changed()
+
+    async def disconnected(self, e):
+        self._changed()  # pyytlounge drops the session right after this returns; the push is debounced
+
+    # --- Live Activities (never raise, never block)
+    def _note_state(self, state):
+        """Starting to play: Playing a different video than the last one reported Playing, or the
+        first Playing since the session (re)connected or after PLAY_IDLE_S without Playing."""
+        try:
+            now = live.clock()
+            if state != State.Playing:
+                if self._playing:
+                    self._playing, self._stopped_at = False, now
+                return
+            starts = (self._fresh or self.video_id != self._played_video
+                      or (not self._playing and now - self._stopped_at >= PLAY_IDLE_S))
+            self._fresh, self._playing, self._played_video = False, True, self.video_id
+            if starts:
+                live.started_playing(self.owner, self.id)
+        except Exception:
+            log.exception("%s: live activity start check failed", self.name)
+
+    def _changed(self):
+        try:
+            live.changed(self.owner, self.id)
+        except Exception:
+            log.exception("%s: live activity update failed", self.name)
 
     async def set_speed(self, speed: float):
         """Set the speed and, if it changes, wait for the TV to apply it: a caption command
@@ -86,11 +142,13 @@ class Device(EventListener):
             except asyncio.TimeoutError:
                 log.warning("%s: TV didn't report a speed change to %s", self.name, speed)
         self.speed = speed  # callers render the response, even if the TV's event is late
+        self._changed()
 
     async def subtitles_track_changed(self, e):
         log.info("%s captions: video=%s lang=%r kind=%r", self.name, e.video_id, e.language_code, e.kind)
         self.captions = bool(e.language_code)
         self._captions_changed.set()
+        self._changed()
 
     # --- captions
     async def _send_captions(self, on: bool):
@@ -126,6 +184,10 @@ class Device(EventListener):
 
     # --- lifecycle
     @property
+    def display_name(self) -> str:
+        return self.custom_name or self.name
+
+    @property
     def id(self) -> str:
         return self.api.auth.screen_id
 
@@ -145,11 +207,15 @@ class Device(EventListener):
                 if not self.api.linked():
                     await self.api.refresh_auth()
                     save_devices()
+                was_connected = self.api.connected()
                 if await self.api.connect():
+                    if not was_connected:
+                        self._fresh = True
                     if self.api.screen_name and self.name != self.api.screen_name:
                         self.name = self.api.screen_name
                         save_devices()
                     log.info("connected to %s", self.name)
+                    self._changed()
                     await self.api.get_now_playing()
                     await self.api.subscribe()  # blocks until the session drops
                     log.info("session ended: %s", self.name)
@@ -157,21 +223,40 @@ class Device(EventListener):
                 raise
             except Exception as ex:
                 log.warning("%s session error: %s", self.name, ex)
-            await asyncio.sleep(10)  # TV off / app closed: retry quietly
+            self._changed()
+            await asyncio.sleep(RECONNECT_S)  # TV off / app closed: retry quietly
 
     def info(self) -> dict:
-        return {"id": self.id, "name": self.name, "connected": self.api.connected(),
+        return {"id": self.id, "name": self.display_name, "connected": self.api.connected(),
                 "video_id": self.video_id, "speed": self.speed, "captions": self.captions}
 
 
+def activity_state(d: Device) -> dict:
+    """The Live Activity content-state for a TV: SpeedAttributes.ContentState in the app."""
+    return {"deviceId": d.id, "deviceName": d.display_name, "speed": d.speed, "captions": d.captions,
+            "connected": d.api.connected()}
+
+
 devices: dict[tuple[str, str], Device] = {}  # (owner, screen_id) -> Device
+
+
+def _lookup(owner: str, device_id: str) -> dict | None:
+    d = devices.get((owner, device_id))
+    return activity_state(d) if d else None
+
+
+live = live_push.LiveActivities(
+    DATA / "installs.json",
+    live_push.Relay(CANOPY_APNS_URL, CANOPY_APNS_KEY) if CANOPY_APNS_KEY else None,
+    CANOPY_CONTROL_BUNDLE_ID, _lookup)
 
 
 def save_devices():
     DATA.mkdir(parents=True, exist_ok=True)
     # api.store_auth_state() writes a format load_auth_state() rejects (pyytlounge 3.4 bug)
     DEVICES_FILE.write_text(json.dumps(
-        [{"owner": d.owner, "name": d.name, "auth": d.api.auth.serialize()} for d in devices.values()],
+        [{"owner": d.owner, "name": d.name, **({"custom_name": d.custom_name} if d.custom_name else {}),
+          "auth": d.api.auth.serialize()} for d in devices.values()],
         indent=1))
 
 
@@ -194,7 +279,8 @@ def load_devices() -> tuple[list[Device], int]:
         if not isinstance(owner, str) or not owner:
             dropped += 1
             continue
-        d = Device(owner, entry.get("name", "TV"))
+        custom = entry.get("custom_name")
+        d = Device(owner, entry.get("name", "TV"), custom if isinstance(custom, str) and custom else None)
         try:
             d.api.load_auth_state(_normalize_auth(entry["auth"]))
             out.append(d)
@@ -213,6 +299,11 @@ async def lifespan(_):
                      "Manager's Sites tab and set its key as CANOPY_ACCOUNT_KEY.")
         raise RuntimeError("CANOPY_ACCOUNT_KEY is not set")
     log.info("Canopy Accounts at %s", canopy.base)
+    if live.relay:
+        log.info("Live Activity pushes for %s via %s", live.bundle_id, live.relay.base)
+    else:
+        log.info("CANOPY_APNS_KEY is not set: Live Activity pushes are off (installs are still stored)")
+    live.load()
     loaded, dropped = load_devices()
     for d in loaded:
         devices[(d.owner, d.id)] = d
@@ -223,6 +314,7 @@ async def lifespan(_):
     yield
     for d in devices.values():
         await d.stop()
+    await live.close()
     await canopy.close()
 
 
@@ -268,7 +360,7 @@ def get(owner: str, device_id: str, need_video=False) -> Device:
     if not d:
         raise HTTPException(404, "unknown device")
     if not d.api.connected():
-        raise HTTPException(503, f"{d.name} not connected (is YouTube open on it?)")
+        raise HTTPException(503, f"{d.display_name} not connected (is YouTube open on it?)")
     if need_video and not d.video_id:
         raise HTTPException(409, "no video playing")
     return d
@@ -301,9 +393,28 @@ async def pair(body: Pair, person: dict = Depends(require_person)):
     old = devices.get(key)  # re-pairing the same TV replaces this person's entry
     devices[key] = d
     if old:
+        d.custom_name = old.custom_name  # but keeps their name for it
         await old.stop()
     d.task = asyncio.create_task(d._loop())
     save_devices()
+    return d.info()
+
+
+class Rename(BaseModel):
+    name: str | None  # required; null or "" goes back to the TV's own name
+
+
+@app.patch("/devices/{device_id}")
+async def rename(device_id: str, body: Rename, person: dict = Depends(require_person)):
+    d = devices.get((person["id"], device_id))
+    if not d:
+        raise HTTPException(404, "unknown device")
+    name = None if body.name in (None, "") else body.name.strip()
+    if name is not None and not 1 <= len(name) <= MAX_NAME:
+        raise HTTPException(400, f"name must be 1 to {MAX_NAME} characters (or empty to use the TV's own name)")
+    d.custom_name = name
+    save_devices()
+    d._changed()
     return d.info()
 
 
@@ -312,8 +423,10 @@ async def remove(device_id: str, person: dict = Depends(require_person)):
     d = devices.pop((person["id"], device_id), None)
     if not d:
         raise HTTPException(404, "unknown device")
+    state = activity_state(d)
     await d.stop()
     save_devices()
+    live.removed(person["id"], device_id, state)
     return {"removed": device_id}
 
 
@@ -339,5 +452,52 @@ async def set_captions(device_id: str, mode: str, person: dict = Depends(require
     if d.captions != (mode == "on"):
         hint = f" (does this video have '{CAPTION_LANG}' captions?)" if mode == "on" else ""
         # not 502: Cloudflare replaces 502 bodies with its own page, hiding the detail
-        raise HTTPException(409, f"{d.name} didn't turn captions {mode}{hint}")
+        raise HTTPException(409, f"{d.display_name} didn't turn captions {mode}{hint}")
     return d.info()
+
+
+class ActivityBody(BaseModel):
+    token: str
+    device_id: str
+
+
+class InstallBody(BaseModel):
+    """All optional: an absent field is left as is, null clears it."""
+    environment: str | None = None
+    push_to_start_token: str | None = None
+    activity: ActivityBody | None = None
+
+
+def _install_id(install_id: str) -> str:
+    if not live_push.UUID_RE.match(install_id):
+        raise HTTPException(400, "install_id must be a UUID")
+    return install_id.lower()
+
+
+@app.put("/installs/{install_id}")
+async def put_install(install_id: str, body: InstallBody, person: dict = Depends(require_person)):
+    install_id = _install_id(install_id)
+    owner = person["id"]
+    changes = {k: getattr(body, k) for k in body.model_fields_set}
+    if changes.get("environment") is not None and changes["environment"] not in live_push.ENVIRONMENTS:
+        raise HTTPException(400, "environment must be sandbox or production")
+    if changes.get("push_to_start_token") is not None:
+        if not live_push.valid_token(changes["push_to_start_token"]):
+            raise HTTPException(400, "push_to_start_token must be hex, up to 200 characters")
+        changes["push_to_start_token"] = changes["push_to_start_token"].lower()
+    if changes.get("activity") is not None:
+        a = changes["activity"]
+        if not live_push.valid_token(a.token):
+            raise HTTPException(400, "activity.token must be hex, up to 200 characters")
+        if (owner, a.device_id) not in devices:
+            raise HTTPException(404, "unknown device")
+        changes["activity"] = {"token": a.token.lower(), "device_id": a.device_id}
+    live.put(install_id, owner, changes)
+    return {"ok": True}
+
+
+@app.delete("/installs/{install_id}")
+async def delete_install(install_id: str, person: dict = Depends(require_person)):
+    if not live.delete(_install_id(install_id), person["id"]):
+        raise HTTPException(404, "unknown install")
+    return {"ok": True}
