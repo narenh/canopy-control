@@ -1,0 +1,3 @@
+fastapi
+uvicorn
+pyytlounge==3.4.0

@@ -1,0 +1,8 @@
+services:
+  yt-speed:
+    build: .
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    environment:
+      CAPTION_LANG: en
+    volumes: ["./data:/data"]
