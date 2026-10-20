@@ -4,7 +4,7 @@ GET    /                          - web UI
 GET    /devices                   - paired TVs with connection/playback state
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
 DELETE /devices/{id}              - forget a TV
-POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
+POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1 (re-applied per video), off at 1
 POST   /devices/{id}/captions/{on|off}
 """
 import asyncio, json, logging, os
@@ -15,11 +15,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pyytlounge import YtLoungeApi, EventListener
+from pyytlounge.models import State
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
 LEGACY_AUTH = DATA / "auth.json"  # single-TV file from earlier versions
 CAPTION_LANG = os.environ.get("CAPTION_LANG", "en")
+CAPTION_WAIT = 3.0  # seconds to wait for the TV to report a caption change
 SPEEDS = {1.0, 1.25, 1.5, 1.75, 2.0}
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
@@ -34,18 +36,50 @@ class Device(EventListener):
         self.task: asyncio.Task | None = None
         self.video_id: str | None = None
         self.speed = 1.0
-        self.captions = False
+        self.captions = False  # only ever set from the TV's onSubtitlesTrackChanged
+        self._captions_changed = asyncio.Event()
+        self._auto_captioned: str | None = None  # last video the above-1x rule was applied to
 
     # --- events from the TV
     async def now_playing_changed(self, e):
         if e.video_id:
             self.video_id = e.video_id
+        if e.state == State.Playing:
+            await self._auto_caption()
+
+    async def playback_state_changed(self, e):
+        if e.state == State.Playing:
+            await self._auto_caption()
 
     async def playback_speed_changed(self, e):
         self.speed = e.playback_speed
 
     async def subtitles_track_changed(self, e):
+        log.info("%s captions: video=%s lang=%r kind=%r", self.name, e.video_id, e.language_code, e.kind)
         self.captions = bool(e.language_code)
+        self._captions_changed.set()
+
+    # --- captions
+    async def _auto_caption(self):
+        """The TV keeps the speed across videos but not captions, so re-apply the rule per video."""
+        if self.speed <= 1 or not self.video_id or self.video_id == self._auto_captioned:
+            return
+        self._auto_captioned = self.video_id
+        try:
+            # Don't wait for the change here: the TV's reply arrives through this same event loop.
+            await self.api.set_closed_captions(CAPTION_LANG, self.video_id)
+        except Exception as ex:
+            log.warning("%s auto-captions failed: %s", self.name, ex)
+
+    async def set_captions(self, on: bool):
+        """Ask the TV for captions; if that's a change, wait for the TV to confirm it."""
+        self._captions_changed.clear()
+        await self.api.set_closed_captions(CAPTION_LANG if on else None, self.video_id)
+        if self.captions != on:
+            try:
+                await asyncio.wait_for(self._captions_changed.wait(), CAPTION_WAIT)
+            except asyncio.TimeoutError:
+                log.warning("%s: TV didn't report a caption change for %s", self.name, self.video_id)
 
     # --- lifecycle
     @property
@@ -192,8 +226,8 @@ async def set_speed(device_id: str, speed: float):
     await d.api.set_playback_speed(speed)
     d.speed = speed  # don't wait for the TV's event; callers render the response
     if d.video_id:
-        await d.api.set_closed_captions(CAPTION_LANG if speed > 1 else None, d.video_id)
-        d.captions = speed > 1
+        d._auto_captioned = d.video_id
+        await d.set_captions(speed > 1)
     return d.info()
 
 
@@ -202,8 +236,10 @@ async def set_captions(device_id: str, mode: str):
     if mode not in ("on", "off"):
         raise HTTPException(400, "mode must be on or off")
     d = get(device_id, need_video=True)
-    await d.api.set_closed_captions(CAPTION_LANG if mode == "on" else None, d.video_id)
-    d.captions = mode == "on"
+    await d.set_captions(mode == "on")
+    if d.captions != (mode == "on"):
+        hint = f" (does this video have '{CAPTION_LANG}' captions?)" if mode == "on" else ""
+        raise HTTPException(502, f"{d.name} didn't turn captions {mode}{hint}")
     return d.info()
 
 
