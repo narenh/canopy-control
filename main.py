@@ -44,7 +44,20 @@ api = YtLoungeApi("Speed Remote", state)
 
 def save_auth():
     AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    AUTH_FILE.write_text(json.dumps(api.store_auth_state()))
+    # api.store_auth_state() writes a format load_auth_state() rejects (pyytlounge 3.4 bug)
+    AUTH_FILE.write_text(json.dumps(api.auth.serialize()))
+
+
+def load_auth():
+    data = json.loads(AUTH_FILE.read_text())
+    if "version" not in data:  # migrate files written by store_auth_state()
+        data = {"version": 0, "screenId": data.get("screenId"),
+                "loungeIdToken": data.get("lounge_id_token"),
+                "refreshToken": data.get("refresh_token"), "expiry": None}
+    try:
+        api.load_auth_state(data)
+    except Exception as ex:
+        log.warning("ignoring unreadable auth file (re-pair needed): %s", ex)
 
 
 async def session_loop():
@@ -71,7 +84,7 @@ async def session_loop():
 async def lifespan(_):
     async with api:
         if AUTH_FILE.exists():
-            api.load_auth_state(json.loads(AUTH_FILE.read_text()))
+            load_auth()
         task = asyncio.create_task(session_loop())
         yield
         task.cancel()
