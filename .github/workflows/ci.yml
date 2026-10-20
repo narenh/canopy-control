@@ -1,0 +1,47 @@
+# The check Renovate's automerge waits on (renovate.json): an iSponsorBlockTV image update only
+# merges, and so deploys, if all of this passes with it.
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install requirements (+ httpx for TestClient, pyyaml for the wrapper test)
+        run: pip install -r requirements.txt httpx pyyaml
+      - name: test_api
+        run: python -I tests/test_api.py
+      - name: test_push
+        run: python -I tests/test_push.py
+      - name: check (captions)
+        run: python -I tests/check.py
+      - name: test_cache
+        run: python -I tests/test_cache.py
+      - name: test_skip
+        run: python -I tests/test_skip.py
+      - name: test_wrapper
+        run: python -I tests/test_wrapper.py
+
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: docker compose config
+        run: CANOPY_ACCOUNT_KEY=dummy docker compose config --quiet
+      - name: Build the api image (the plain Dockerfile, as Coolify's Dockerfile build pack does)
+        run: docker build -t canopy-control-api .
+      - name: Compose smoke test with the upstream iSponsorBlockTV image
+        run: tests/smoke_compose.sh

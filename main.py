@@ -6,7 +6,8 @@ their own Lounge session. Up to MAX_DEVICES TVs per person. There is no web UI.
 
 GET    /devices                   - the caller's TVs with connection/playback state
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
-PATCH  /devices/{id} {"name": ...} - rename a TV (trimmed, 1-40 chars); null or "" = the TV's own name
+PATCH  /devices/{id} {"name": ..., "skip_sponsors": bool} - either or both: rename a TV (trimmed,
+                                   1-40 chars; null or "" = the TV's own name), skip sponsors on it
 DELETE /devices/{id}              - forget a TV (ends Live Activities showing it)
 POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
@@ -14,7 +15,12 @@ PUT    /installs/{uuid}           - an app install's Live Activity tokens (see b
 DELETE /installs/{uuid}           - forget an install (the app's sign-out)
 
 Errors are JSON {"detail": "<sentence>"}, plus "reason" for: 401 signed_out, 403 email_unverified,
-503 account_unreachable, 409 too_many_devices.
+503 account_unreachable, 409 too_many_devices, 403 skip_not_allowed.
+
+Skip sponsors (an iSponsorBlockTV container next to this one, isbtv.py): on when ISPONSORBLOCKTV_CONFIG
+is set. Each TV in GET /devices etc. then has "skip_sponsors", except for SKIP_HIDDEN_PERSON_IDS (and
+for everyone when it's off), who get 403 skip_not_allowed for PATCH {"skip_sponsors": ...}. The TVs
+with it on, for anyone not hidden, are rendered into iSponsorBlockTV's config.json.
 
 Live Activities (Canopy Control, through the canopy-apns relay; live_push.py): PUT /installs/{uuid}
 takes {"environment": "sandbox"|"production", "push_to_start_token": hex, "activity": {"token":
@@ -28,7 +34,8 @@ Env: CANOPY_ACCOUNT_KEY (required; the site key from the Account Manager's Sites
 CANOPY_ACCOUNT_URL (default https://account.canopysf.com), DATA_DIR (default /data),
 CAPTION_LANG (default en), CANOPY_APNS_KEY (this instance's relay key; unset = no pushes),
 CANOPY_APNS_URL (default https://apns.canopysf.com), CANOPY_CONTROL_BUNDLE_ID (default
-com.canopysf.CanopyControl).
+com.canopysf.CanopyControl); for skip sponsors, ISPONSORBLOCKTV_CONFIG, SKIP_HIDDEN_PERSON_IDS and the
+iSponsorBlockTV settings in isbtv.py.
 """
 import asyncio, json, logging, os
 from contextlib import asynccontextmanager
@@ -36,11 +43,12 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool, model_validator
 from pyytlounge import YtLoungeApi, EventListener
 from pyytlounge.models import State
 
 import canopy_account
+import isbtv
 import live_push
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -60,16 +68,19 @@ RECONNECT_S = 10  # wait between Lounge connection attempts
 PLAY_IDLE_S = 30 * 60  # Playing again after this long without counts as starting to play
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
+ISBTV = isbtv.from_env(os.environ)  # None: skip sponsors is off
 canopy = canopy_account.CanopyAccount(CANOPY_ACCOUNT_URL, CANOPY_ACCOUNT_KEY) if CANOPY_ACCOUNT_KEY else None
 
 
 class Device(EventListener):
     """One paired TV: its Lounge session, reconnect loop, and last-known playback state."""
 
-    def __init__(self, owner: str, name: str = "TV", custom_name: str | None = None):
+    def __init__(self, owner: str, name: str = "TV", custom_name: str | None = None,
+                 skip_sponsors: bool = False):
         self.owner = owner  # Canopy person id of whoever paired it
         self.name = name  # what the TV calls itself
         self.custom_name = custom_name  # what its owner renamed it to, if they did
+        self.skip_sponsors = skip_sponsors  # its owner wants iSponsorBlockTV on it
         self.api = YtLoungeApi("Speed Remote", self)
         self.task: asyncio.Task | None = None
         self.video_id: str | None = None
@@ -232,8 +243,15 @@ class Device(EventListener):
             await asyncio.sleep(RECONNECT_S)  # TV off / app closed: retry quietly
 
     def info(self) -> dict:
-        return {"id": self.id, "name": self.display_name, "connected": self.api.connected(),
-                "video_id": self.video_id, "speed": self.speed, "captions": self.captions}
+        out = {"id": self.id, "name": self.display_name, "connected": self.api.connected(),
+               "video_id": self.video_id, "speed": self.speed, "captions": self.captions}
+        if skip_allowed(self.owner):  # the app shows the toggle only when this is there
+            out["skip_sponsors"] = self.skip_sponsors
+        return out
+
+
+def skip_allowed(owner: str) -> bool:
+    return ISBTV is not None and owner not in ISBTV.hidden
 
 
 def activity_state(d: Device) -> dict:
@@ -261,8 +279,23 @@ def save_devices():
     # api.store_auth_state() writes a format load_auth_state() rejects (pyytlounge 3.4 bug)
     DEVICES_FILE.write_text(json.dumps(
         [{"owner": d.owner, "name": d.name, **({"custom_name": d.custom_name} if d.custom_name else {}),
+          **({"skip_sponsors": True} if d.skip_sponsors else {}),
           "auth": d.api.auth.serialize()} for d in devices.values()],
         indent=1))
+    render_isbtv()
+
+
+def render_isbtv():
+    """iSponsorBlockTV's config.json from the TVs with skip sponsors on (rewritten only on a change,
+    since every rewrite restarts it). Never raises: a failure here mustn't fail a pairing."""
+    if ISBTV is None:
+        return
+    try:
+        tvs = [(d.id, d.display_name) for d in devices.values() if d.skip_sponsors and skip_allowed(d.owner)]
+        if ISBTV.write(tvs):
+            log.info("iSponsorBlockTV config: %d TV(s) skipping sponsors", len(ISBTV.devices(tvs)))
+    except Exception:
+        log.exception("couldn't write iSponsorBlockTV's config %s", ISBTV.path)
 
 
 def _normalize_auth(data: dict) -> dict:
@@ -285,7 +318,8 @@ def load_devices() -> tuple[list[Device], int]:
             dropped += 1
             continue
         custom = entry.get("custom_name")
-        d = Device(owner, entry.get("name", "TV"), custom if isinstance(custom, str) and custom else None)
+        d = Device(owner, entry.get("name", "TV"), custom if isinstance(custom, str) and custom else None,
+                   entry.get("skip_sponsors") is True)
         try:
             d.api.load_auth_state(_normalize_auth(entry["auth"]))
             out.append(d)
@@ -295,6 +329,20 @@ def load_devices() -> tuple[list[Device], int]:
         log.warning("dropped %d TV(s) paired before Canopy Accounts (no owner): re-pair them from the app",
                     dropped)
     return out, dropped
+
+
+def check_writable(path: Path):
+    """Fail at startup, not at the first pairing, if the data dir isn't writable (the image runs
+    as uid 10001: a volume made by an older, root image needs a chown)."""
+    probe = path / ".write-test"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as ex:
+        log.critical("%s isn't writable by uid %s (%s): refusing to start. Give the volume to this "
+                     "user (chown -R 10001:10001) or start from an empty volume.", path, os.getuid(), ex)
+        raise RuntimeError(f"{path} isn't writable") from ex
 
 
 @asynccontextmanager
@@ -308,12 +356,19 @@ async def lifespan(_):
         log.info("Live Activity pushes for %s via %s", live.bundle_id, live.relay.base)
     else:
         log.info("CANOPY_APNS_KEY is not set: Live Activity pushes are off (installs are still stored)")
+    if ISBTV:
+        log.info("skip sponsors on: iSponsorBlockTV config at %s, %d hidden person(s)", ISBTV.path,
+                 len(ISBTV.hidden))
+    else:
+        log.info("ISPONSORBLOCKTV_CONFIG is not set: skip sponsors is off")
+    check_writable(DATA)
     live.load()
     loaded, dropped = load_devices()
     for d in loaded:
         devices[(d.owner, d.id)] = d
     if dropped:
         save_devices()  # rewrite without the ownerless entries
+    render_isbtv()  # also drops TVs of people added to SKIP_HIDDEN_PERSON_IDS since the last run
     for d in devices.values():
         await d.start()
     yield
@@ -399,27 +454,46 @@ async def pair(body: Pair, person: dict = Depends(require_person)):
     devices[key] = d
     if old:
         d.custom_name = old.custom_name  # but keeps their name for it
+        d.skip_sponsors = old.skip_sponsors  # and their skip choice
         await old.stop()
     d.task = asyncio.create_task(d._loop())
     save_devices()
     return d.info()
 
 
-class Rename(BaseModel):
-    name: str | None  # required; null or "" goes back to the TV's own name
+class DevicePatch(BaseModel):
+    """At least one of the two. name: null or "" goes back to the TV's own name."""
+    name: str | None = None
+    skip_sponsors: StrictBool | None = None  # true or false; null is refused below
+
+    @model_validator(mode="after")
+    def _some(self):
+        if not self.model_fields_set:
+            raise ValueError("send name, skip_sponsors or both")
+        if "skip_sponsors" in self.model_fields_set and self.skip_sponsors is None:
+            raise ValueError("skip_sponsors must be true or false")
+        return self
 
 
 @app.patch("/devices/{device_id}")
-async def rename(device_id: str, body: Rename, person: dict = Depends(require_person)):
+async def patch_device(device_id: str, body: DevicePatch, person: dict = Depends(require_person)):
     d = devices.get((person["id"], device_id))
     if not d:
         raise HTTPException(404, "unknown device")
-    name = None if body.name in (None, "") else body.name.strip()
-    if name is not None and not 1 <= len(name) <= MAX_NAME:
-        raise HTTPException(400, f"name must be 1 to {MAX_NAME} characters (or empty to use the TV's own name)")
-    d.custom_name = name
+    sent = body.model_fields_set
+    # everything is checked before anything changes, so a refused PATCH changes nothing
+    if "skip_sponsors" in sent and not skip_allowed(person["id"]):
+        raise ApiError(403, "Skipping sponsors isn't available for this account.", "skip_not_allowed")
+    if "name" in sent:
+        name = None if body.name in (None, "") else body.name.strip()
+        if name is not None and not 1 <= len(name) <= MAX_NAME:
+            raise HTTPException(400, f"name must be 1 to {MAX_NAME} characters (or empty to use the TV's own name)")
+        d.custom_name = name
+    if "skip_sponsors" in sent:
+        d.skip_sponsors = body.skip_sponsors
     save_devices()
-    d._changed()
+    if "name" in sent:
+        d._changed()
     return d.info()
 
 

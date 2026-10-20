@@ -1,12 +1,135 @@
+# Canopy Control: the API (the only service exposed; Coolify routes its domain to api:8000) and an
+# unmodified upstream iSponsorBlockTV that skips sponsors on the TVs people turn it on for.
+#
+# api owns iSponsorBlockTV's config.json on the shared isbtv-config volume (read-only for
+# isponsorblocktv) and rewrites it, atomically and only on a change, when a TV's "Skip sponsors"
+# changes. iSponsorBlockTV reads its config only at startup, so its service runs the upstream
+# command under the small wrapper below, which restarts it when config.json changes.
+# No Docker socket anywhere. Both services: non-root, read-only root fs, no capabilities.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  user: "10001:10001"  # the same uid/gid in both: api writes config.json 0640, isponsorblocktv reads it
+  read_only: true
+  tmpfs: ["/tmp:size=16m,mode=1777"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
 services:
-  yt-speed:
+  api:
+    <<: *hardening
     build: .
-    restart: unless-stopped
-    ports: ["8000:8000"]
+    expose: ["8000"]  # Coolify's proxy reaches it here; nothing is published on the host
     environment:
-      CAPTION_LANG: en
+      CAPTION_LANG: ${CAPTION_LANG:-en}
       CANOPY_ACCOUNT_URL: ${CANOPY_ACCOUNT_URL:-https://account.canopysf.com}
-      CANOPY_ACCOUNT_KEY: ${CANOPY_ACCOUNT_KEY}  # required; the server refuses to start without it
+      CANOPY_ACCOUNT_KEY: ${CANOPY_ACCOUNT_KEY:?set CANOPY_ACCOUNT_KEY}  # the server refuses to start without it
       CANOPY_APNS_URL: ${CANOPY_APNS_URL:-https://apns.canopysf.com}
       CANOPY_APNS_KEY: ${CANOPY_APNS_KEY:-}  # optional; without it there are no Live Activity pushes
-    volumes: ["./data:/data"]
+      # Skip sponsors: on because this is set. The rest are iSponsorBlockTV's settings (isbtv.py).
+      ISPONSORBLOCKTV_CONFIG: /isbtv/config.json
+      SKIP_HIDDEN_PERSON_IDS: ${SKIP_HIDDEN_PERSON_IDS:-}  # comma-separated Canopy person ids (App Review)
+      SKIP_CATEGORIES: ${SKIP_CATEGORIES:-sponsor,selfpromo,music_offtopic}
+      SKIP_ADS: ${SKIP_ADS:-true}
+      MUTE_ADS: ${MUTE_ADS:-false}
+      AUTO_PLAY: ${AUTO_PLAY:-false}
+      SKIP_MINIMUM_LENGTH: ${SKIP_MINIMUM_LENGTH:-1}
+      SKIP_JOIN_NAME: ${SKIP_JOIN_NAME:-Canopy Control}
+      SKIP_COUNT_TRACKING: ${SKIP_COUNT_TRACKING:-true}
+    volumes:
+      - api-data:/data
+      - isbtv-config:/isbtv
+
+  isponsorblocktv:
+    <<: *hardening
+    # Renovate keeps this current (renovate.json); updates auto-merge once CI passes.
+    image: ghcr.io/dmunozv04/isponsorblocktv:v2.11.0@sha256:d1e876636754fb2b54490feebe3af4a321f7f2a932a2d57b67b2a667eea40823
+    # The image's own ENTRYPOINT is ["python3", "-u", "main.pyc"] (WORKDIR /app, data in /app/data).
+    # It runs here as `command`, a child of this wrapper: started once config.json lists a TV,
+    # restarted when the file changes (mtime/size/inode polled every 3 s) or if it exits (backoff
+    # 5 s doubling to 5 min), and sent SIGTERM when the container stops. No $ in it (compose
+    # would interpolate it).
+    entrypoint:
+      - python3
+      - -c
+      - |
+        import json, os, signal, subprocess, sys, time
+        CONFIG = os.path.join(os.environ.get("iSPBTV_data_dir") or "data", "config.json")
+        POLL_S = float(os.environ.get("WRAPPER_POLL_S") or 3)
+        STOP_S = 10
+        cmd = sys.argv[1:]
+        child, stopping = None, False
+
+        def log(msg):
+            print("[wrapper] " + msg, flush=True)
+
+        def stamp():
+            try:
+                st = os.stat(CONFIG)
+                return (st.st_mtime_ns, st.st_size, st.st_ino)
+            except OSError:
+                return None
+
+        def device_count():
+            try:
+                with open(CONFIG, encoding="utf-8") as f:
+                    return len(json.load(f).get("devices") or [])
+            except FileNotFoundError:
+                return 0
+            except Exception as ex:
+                log(f"can't read {CONFIG}: {ex}")
+                return 0
+
+        def stop_child():
+            global child
+            if child is not None and child.poll() is None:
+                child.send_signal(signal.SIGTERM)
+                try:
+                    child.wait(STOP_S)
+                except subprocess.TimeoutExpired:
+                    log(f"iSponsorBlockTV didn't stop in {STOP_S} s: killing it")
+                    child.kill()
+                    child.wait()
+            child = None
+
+        def on_signal(signum, frame):
+            global stopping
+            stopping = True
+            if child is not None and child.poll() is None:
+                child.send_signal(signal.SIGTERM)
+
+        signal.signal(signal.SIGTERM, on_signal)
+        signal.signal(signal.SIGINT, on_signal)
+        log(f"watching {os.path.abspath(CONFIG)}; command: {' '.join(cmd)}")
+        seen, want, delay, restart_at, started = "unset", False, 5, 0.0, 0.0
+        while not stopping:
+            s = stamp()
+            if s != seen:
+                if seen != "unset":
+                    log("config.json changed")
+                seen = s
+                stop_child()
+                want, delay, restart_at = device_count() > 0, 5, 0.0
+                if not want:
+                    log("no devices in config.json: iSponsorBlockTV not running until that changes")
+            if child is not None and child.poll() is not None:
+                if time.monotonic() - started > 60:
+                    delay = 5
+                log(f"iSponsorBlockTV exited with code {child.returncode}: restarting in {delay} s")
+                child, restart_at, delay = None, time.monotonic() + delay, min(delay * 2, 300)
+            if want and child is None and not stopping and time.monotonic() >= restart_at:
+                log(f"starting iSponsorBlockTV for {device_count()} device(s)")
+                child, started = subprocess.Popen(cmd), time.monotonic()
+            time.sleep(POLL_S)
+        stop_child()
+        log("stopped")
+    command: ["python3", "-u", "main.pyc"]
+    stop_grace_period: 20s
+    # api first: it creates the shared volume (owned by 10001, from its image) and the config
+    depends_on: [api]
+    volumes:
+      - isbtv-config:/app/data:ro
+
+volumes:
+  api-data:
+  isbtv-config:

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "iSponsorBlockTV, pinned by tag and digest in docker-compose.yml: every update (major too) auto-merges once CI passes. Renovate merges it itself after checking the commit's status checks (platformAutomerge off), so a red or pending CI never merges. Merging to main deploys.",
+      "matchManagers": ["docker-compose"],
+      "matchPackageNames": ["ghcr.io/dmunozv04/isponsorblocktv"],
+      "versioning": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": false
+    },
+    {
+      "description": "Our Python dependencies: one grouped PR, never auto-merged (a pyytlounge update needs a real-TV check).",
+      "matchManagers": ["pip_requirements"],
+      "groupName": "python dependencies",
+      "automerge": false
+    },
+    {
+      "description": "The api image's base and the CI actions: PRs for review, not auto-merged.",
+      "matchManagers": ["dockerfile", "github-actions"],
+      "automerge": false
+    }
+  ]
+}
