@@ -6,51 +6,98 @@
   :root { color-scheme: light dark; font-family: -apple-system, system-ui, sans-serif; }
   body { margin: 0; min-height: 100dvh; display: grid; place-items: center; text-align: center; }
   main { width: min(90vw, 480px); }
+  #bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 2rem; }
+  #dev { flex: 1; font-size: 1.2rem; padding: .5rem; }
+  #rm { font-size: .9rem; padding: .5rem .75rem; }
+  #dot { width: .7rem; height: .7rem; border-radius: 50%; background: #888; flex: none; }
+  #dot.on { background: #2b2; }
   #val { font-size: 6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
   input[type=range] { width: 100%; height: 3rem; accent-color: #e33; }
   #ticks { display: flex; justify-content: space-between; opacity: .6; }
   #cc { display: flex; align-items: center; justify-content: center; gap: .75rem; margin-top: 2rem; font-size: 1.3rem; }
   #cc input { width: 1.8rem; height: 1.8rem; accent-color: #e33; }
   #msg { min-height: 1.5em; opacity: .7; margin-top: 1.5rem; }
-  #pair { display: none; margin-top: 2rem; gap: .5rem; justify-content: center; }
+  #pair { display: none; margin-top: 1rem; gap: .5rem; justify-content: center; }
   #pair input, #pair button { font-size: 1.1rem; padding: .5rem; }
+  .off { opacity: .35; pointer-events: none; }
 </style></head>
 <body><main>
-  <div id="val">1×</div>
-  <input id="s" type="range" min="0" max="4" step="1" value="0">
-  <div id="ticks"><span>1</span><span>1.25</span><span>1.5</span><span>1.75</span><span>2</span></div>
-  <label id="cc"><input id="ccbox" type="checkbox"> Captions</label>
-  <div id="msg"></div>
+  <div id="bar">
+    <span id="dot"></span>
+    <select id="dev"></select>
+    <button id="rm">Remove</button>
+  </div>
   <form id="pair"><input id="code" placeholder="TV link code" inputmode="numeric"><button>Pair</button></form>
+  <div id="ctl">
+    <div id="val">1×</div>
+    <input id="s" type="range" min="0" max="4" step="1" value="0">
+    <div id="ticks"><span>1</span><span>1.25</span><span>1.5</span><span>1.75</span><span>2</span></div>
+    <label id="cc"><input id="ccbox" type="checkbox"> Captions</label>
+  </div>
+  <div id="msg"></div>
 </main>
 <script>
-const S = [1, 1.25, 1.5, 1.75, 2], $ = id => document.getElementById(id);
-let sent = 0;
+const S = [1, 1.25, 1.5, 1.75, 2], ADD = '__add', $ = id => document.getElementById(id);
+let sent = 0, cur = null;
+try { cur = localStorage.getItem('dev'); } catch {}
 const show = i => $('val').textContent = S[i] + '×';
-async function status() {
-  const r = await (await fetch('status')).json();
-  $('pair').style.display = r.paired ? 'none' : 'flex';
-  $('msg').textContent = !r.paired ? 'Not paired' : r.connected ? '' : 'Waiting for YouTube on the TV…';
-  const i = S.indexOf(r.speed);
-  if (document.activeElement !== $('ccbox')) $('ccbox').checked = !!r.captions;
-  if (i >= 0 && document.activeElement !== $('s')) { $('s').value = sent = i; show(i); }
+const say = t => $('msg').textContent = t || '';
+const post = async path => {
+  const r = await fetch(`devices/${encodeURIComponent(cur)}/${path}`, { method: 'POST' });
+  if (!r.ok) say((await r.json()).detail); else say('');
+  return r.ok;
+};
+
+function select(id) {
+  cur = id; try { localStorage.setItem('dev', id); } catch {}
+  refresh(true);
 }
+
+async function refresh(force) {
+  const list = await (await fetch('devices')).json();
+  if (cur !== ADD && !list.some(d => d.id === cur)) cur = list[0]?.id ?? ADD;
+  const sel = $('dev');
+  if (document.activeElement !== sel) {
+    sel.innerHTML = list.map(d => `<option value="${d.id}">${d.name.replace(/</g, '&lt;')}</option>`).join('')
+                  + `<option value="${ADD}">+ Add TV…</option>`;
+    sel.value = cur;
+  }
+  const d = list.find(d => d.id === cur), adding = cur === ADD;
+  $('pair').style.display = adding ? 'flex' : 'none';
+  $('rm').style.display = adding ? 'none' : '';
+  $('ctl').classList.toggle('off', !d?.connected);
+  $('dot').classList.toggle('on', !!d?.connected);
+  if (adding) return say(list.length ? '' : 'Pair a TV: YouTube → Settings → Link with TV code');
+  if (!d.connected && !$('msg').textContent.startsWith('Pair')) say('Waiting for YouTube on ' + d.name + '…');
+  else if (d.connected && $('msg').textContent.startsWith('Waiting')) say('');
+  const i = S.indexOf(d.speed);
+  if (i >= 0 && (force || document.activeElement !== $('s'))) { $('s').value = sent = i; show(i); }
+  if (force || document.activeElement !== $('ccbox')) $('ccbox').checked = !!d.captions;
+}
+
+$('dev').onchange = e => { say(''); select(e.target.value); };
 $('s').oninput = e => show(+e.target.value);
 $('s').onchange = async e => {
   const i = +e.target.value; if (i === sent) return; sent = i;
-  const r = await fetch('speed/' + S[i], { method: 'POST' });
-  $('msg').textContent = r.ok ? '' : (await r.json()).detail;
+  await post('speed/' + S[i]);
 };
 $('ccbox').onchange = async e => {
-  const r = await fetch('captions/' + (e.target.checked ? 'on' : 'off'), { method: 'POST' });
-  if (!r.ok) { e.target.checked = !e.target.checked; $('msg').textContent = (await r.json()).detail; }
+  if (!await post('captions/' + (e.target.checked ? 'on' : 'off'))) e.target.checked = !e.target.checked;
+};
+$('rm').onclick = async () => {
+  const name = $('dev').selectedOptions[0]?.textContent;
+  if (!confirm(`Remove ${name}?`)) return;
+  await fetch(`devices/${encodeURIComponent(cur)}`, { method: 'DELETE' });
+  cur = null; refresh(true);
 };
 $('pair').onsubmit = async e => {
   e.preventDefault();
   const r = await fetch('pair', { method: 'POST', headers: {'Content-Type': 'application/json'},
                                   body: JSON.stringify({ code: $('code').value }) });
-  $('msg').textContent = r.ok ? 'Paired' : 'Pairing failed'; status();
+  if (!r.ok) return say('Pairing failed');
+  $('code').value = ''; say('');
+  select((await r.json()).id);
 };
-status(); setInterval(status, 3000);
+refresh(true); setInterval(refresh, 3000);
 </script>
 </body></html>
