@@ -1,26 +1,23 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "description": "Set and forget: every update auto-merges once CI (tests + the real-image compose smoke test) passes. Renovate merges it itself after checking the commit's status checks (platformAutomerge off), so a red or pending CI never merges. Merging to main deploys.",
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": false,
+  "minimumReleaseAge": "3 days",
   "packageRules": [
     {
-      "description": "iSponsorBlockTV, pinned by tag and digest in docker-compose.yml: every update (major too) auto-merges once CI passes. Renovate merges it itself after checking the commit's status checks (platformAutomerge off), so a red or pending CI never merges. Merging to main deploys.",
+      "description": "iSponsorBlockTV, pinned by tag and digest in docker-compose.yml: take every release (major too) as soon as it's out, to keep up with YouTube changes.",
       "matchManagers": ["docker-compose"],
       "matchPackageNames": ["ghcr.io/dmunozv04/isponsorblocktv"],
       "versioning": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$",
-      "automerge": true,
-      "automergeType": "pr",
-      "platformAutomerge": false
+      "minimumReleaseAge": null
     },
     {
-      "description": "Our Python dependencies: one grouped PR, never auto-merged (a pyytlounge update needs a real-TV check).",
+      "description": "Our Python dependencies, as one PR.",
       "matchManagers": ["pip_requirements"],
-      "groupName": "python dependencies",
-      "automerge": false
-    },
-    {
-      "description": "The api image's base and the CI actions: PRs for review, not auto-merged.",
-      "matchManagers": ["dockerfile", "github-actions"],
-      "automerge": false
+      "groupName": "python dependencies"
     }
   ]
 }
