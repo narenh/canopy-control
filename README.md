@@ -124,7 +124,7 @@ Pairings persist in `devices.json` on the `api-data` volume (`/data`), each with
 Until this is done, pushing `main` still builds the plain Dockerfile: skip sponsors is then off (no `ISPONSORBLOCKTV_CONFIG`), and the api runs as uid 10001, so a `/data` storage that the old root image wrote to must be chowned or emptied first (the server says so in its log and won't start otherwise).
 
 1. In the application: **Configuration → General → Build Pack**: choose **Docker Compose**. Base Directory `/`, Docker Compose Location `/docker-compose.yml`. Save, then **Reload Compose File** so Coolify reads the two services.
-2. **Domains**: for `api`, `https://ytspeed.canopysf.com:8000` (the `:8000` is the container port Coolify's proxy routes to; nothing is published on the host). Leave `isponsorblocktv` with no domain.
+2. **Domains**: for `api`, `https://control.canopysf.com:8000` (the `:8000` is the container port Coolify's proxy routes to; nothing is published on the host). Leave `isponsorblocktv` with no domain.
 3. **Environment Variables** (Coolify lists the `${...}` ones from the compose file; all of them go to `api`, `isponsorblocktv` takes none):
    - `CANOPY_ACCOUNT_KEY` — required (the same value as now)
    - `CANOPY_APNS_KEY` — the same value as now
