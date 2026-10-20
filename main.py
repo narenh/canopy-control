@@ -4,8 +4,8 @@ GET    /                          - web UI
 GET    /devices                   - paired TVs with connection/playback state
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
 DELETE /devices/{id}              - forget a TV
-POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1 (re-applied per video), off at 1
-POST   /devices/{id}/captions/{on|off}
+POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; captions on above 1, off at 1
+POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
 """
 import asyncio, json, logging, os
 from contextlib import asynccontextmanager
@@ -37,8 +37,9 @@ class Device(EventListener):
         self.video_id: str | None = None
         self.speed = 1.0
         self.captions = False  # only ever set from the TV's onSubtitlesTrackChanged
+        self.want_captions: bool | None = None  # last control wins: slider (on above 1x) or toggle
         self._captions_changed = asyncio.Event()
-        self._auto_captioned: str | None = None  # last video the above-1x rule was applied to
+        self._auto_captioned: str | None = None  # last video want_captions was applied to
 
     # --- events from the TV
     async def now_playing_changed(self, e):
@@ -60,21 +61,31 @@ class Device(EventListener):
         self._captions_changed.set()
 
     # --- captions
+    async def _send_captions(self, on: bool):
+        if on:
+            await self.api.set_closed_captions(CAPTION_LANG, self.video_id)
+        else:
+            # pyytlounge sends languageCode="" for off, which the TV ignores. YouTube's own remote
+            # (player remote.js) sends setSubtitlesTrack with only the videoId.
+            await self.api._command("setSubtitlesTrack", {"videoId": self.video_id})
+
     async def _auto_caption(self):
-        """The TV keeps the speed across videos but not captions, so re-apply the rule per video."""
-        if self.speed <= 1 or not self.video_id or self.video_id == self._auto_captioned:
+        """The TV keeps the speed across videos but not captions, so re-apply the last choice per video."""
+        if self.want_captions is None or not self.video_id or self.video_id == self._auto_captioned:
             return
         self._auto_captioned = self.video_id
         try:
             # Don't wait for the change here: the TV's reply arrives through this same event loop.
-            await self.api.set_closed_captions(CAPTION_LANG, self.video_id)
+            await self._send_captions(self.want_captions)
         except Exception as ex:
             log.warning("%s auto-captions failed: %s", self.name, ex)
 
     async def set_captions(self, on: bool):
         """Ask the TV for captions; if that's a change, wait for the TV to confirm it."""
+        self.want_captions = on
+        self._auto_captioned = self.video_id
         self._captions_changed.clear()
-        await self.api.set_closed_captions(CAPTION_LANG if on else None, self.video_id)
+        await self._send_captions(on)
         if self.captions != on:
             try:
                 await asyncio.wait_for(self._captions_changed.wait(), CAPTION_WAIT)
@@ -226,8 +237,9 @@ async def set_speed(device_id: str, speed: float):
     await d.api.set_playback_speed(speed)
     d.speed = speed  # don't wait for the TV's event; callers render the response
     if d.video_id:
-        d._auto_captioned = d.video_id
         await d.set_captions(speed > 1)
+    else:
+        d.want_captions = speed > 1  # applied when the next video starts
     return d.info()
 
 
@@ -239,7 +251,8 @@ async def set_captions(device_id: str, mode: str):
     await d.set_captions(mode == "on")
     if d.captions != (mode == "on"):
         hint = f" (does this video have '{CAPTION_LANG}' captions?)" if mode == "on" else ""
-        raise HTTPException(502, f"{d.name} didn't turn captions {mode}{hint}")
+        # not 502: Cloudflare replaces 502 bodies with its own page, hiding the detail
+        raise HTTPException(409, f"{d.name} didn't turn captions {mode}{hint}")
     return d.info()
 
 

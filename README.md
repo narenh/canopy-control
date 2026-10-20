@@ -6,8 +6,8 @@ Self-hosted playback-speed remote for YouTube on a TV. Uses the unofficial YouTu
 - `GET /devices` — paired TVs with connection and playback state
 - `POST /pair {"code": "..."}` — add a TV (YouTube → Settings → Link with TV code)
 - `DELETE /devices/{id}` — forget a TV
-- `POST /devices/{id}/speed/{x}` — sets speed; captions on above 1x (re-applied when a new video starts), off at 1x (`CAPTION_LANG`, default `en`)
-- `POST /devices/{id}/captions/{on|off}` — manual caption toggle; 502 if the TV does not confirm the change
+- `POST /devices/{id}/speed/{x}` — sets speed; captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`)
+- `POST /devices/{id}/captions/{on|off}` — manual caption toggle; 409 if the TV does not confirm the change. Whichever of slider/toggle was used last wins and is re-applied to each new video
 
 ```
 docker compose up -d --build
