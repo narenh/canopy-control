@@ -79,7 +79,7 @@ class FakeAuth:
 class FakeLounge:
     all = []
 
-    def __init__(self, name, listener=None):
+    def __init__(self, name, listener=None, remote_key=None):
         self.listener, self.auth, self.screen_name, self.closed = listener, FakeAuth(), None, False
         FakeLounge.all.append(self)
     async def __aenter__(self): return self
@@ -99,7 +99,7 @@ class FakeLounge:
         asyncio.create_task(reply())
 
 
-main.YtLoungeApi = FakeLounge
+main.LoungeApi = FakeLounge
 T = [1000.0]
 main.canopy.clock = lambda: T[0]
 

@@ -76,7 +76,7 @@ class FakeAuth:
 
 
 class FakeLounge:
-    def __init__(self, name, listener=None):
+    def __init__(self, name, listener=None, remote_key=None):
         self.listener, self.auth, self.screen_name, self.closed = listener, FakeAuth(), None, False
     async def __aenter__(self): return self
     async def pair(self, code):
@@ -94,7 +94,7 @@ class FakeLounge:
         asyncio.create_task(reply())
 
 
-main.YtLoungeApi = FakeLounge
+main.LoungeApi = FakeLounge
 passed = []
 
 

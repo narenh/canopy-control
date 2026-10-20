@@ -44,10 +44,11 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool, model_validator
-from pyytlounge import YtLoungeApi, EventListener
+from pyytlounge import EventListener
 from pyytlounge.models import State
 
 import canopy_account
+from lounge import LoungeApi
 import isbtv
 import live_push
 
@@ -84,7 +85,7 @@ class Device(EventListener):
         self.name = name  # what the TV calls itself
         self.custom_name = custom_name  # what its owner renamed it to, if they did
         self.skip_sponsors = skip_sponsors  # its owner wants iSponsorBlockTV on it
-        self.api = YtLoungeApi("Speed Remote", self)
+        self.api = LoungeApi("Speed Remote", self, owner)  # its own remote id: see lounge.py
         if LOG_LOUNGE_EVENTS:
             self._log_raw_events()
         self.task: asyncio.Task | None = None

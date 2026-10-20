@@ -91,7 +91,7 @@ class FakeLounge:
     """Codes starting with LIVE connect through _loop (subscribe blocks until dropped); others
     never connect through _loop but report connected, like test_api's fake."""
 
-    def __init__(self, name, listener=None):
+    def __init__(self, name, listener=None, remote_key=None):
         self.listener, self.auth, self.screen_name, self.closed = listener, FakeAuth(), None, False
         self.live, self.sid, self.drop, self.connects = False, False, None, 0
     async def __aenter__(self): return self
@@ -129,7 +129,7 @@ class FakeLounge:
         return True
 
 
-main.YtLoungeApi = FakeLounge
+main.LoungeApi = FakeLounge
 main.RECONNECT_S = 1.0
 T = [1_000_000.0]
 main.live.clock = lambda: T[0]
