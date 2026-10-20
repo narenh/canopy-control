@@ -38,7 +38,11 @@ hex, "device_id": "<one of the caller's TVs>"}}, all optional, null clears. When
 TVs starts playing (a new video, or the first Playing after the session connects or after 30 min
 without), each of their installs gets an update if its activity already shows that TV (and is
 under 8 h old), else a push-to-start (at most one per install and TV per 2 min). Speed, captions,
-connection and name changes go to the activities showing that TV, debounced 0.5 s.
+connection and name changes go to the activities showing that TV, debounced 0.5 s. When a TV stops
+playing (video ended, Stopped, nowPlaying with no video, YouTube closed or the session ended) and
+doesn't play again (Playing/Starting; or Paused, after a dropped session) within
+LIVE_ACTIVITY_END_GRACE_S, the activities showing it are ended (dismissed now) and forgotten, as
+when the TV is removed. Paused alone isn't stopping; a forced _resubscribe() doesn't count.
 
 Env: CANOPY_ACCOUNT_KEY (required; the site key from the Account Manager's Sites tab),
 CANOPY_ACCOUNT_URL (default https://account.canopysf.com), DATA_DIR (default /data),
@@ -83,6 +87,7 @@ RECONNECT_S = 10  # wait between Lounge connection attempts
 # the TV actually reports. On by default while Live Activity starts are being debugged.
 LOG_LOUNGE_EVENTS = (os.environ.get("LOG_LOUNGE_EVENTS") or "1").strip().lower() not in ("0", "false", "no", "off")
 PLAY_IDLE_S = 30 * 60  # Playing again after this long without counts as starting to play
+LIVE_ACTIVITY_END_GRACE_S = 60  # a TV that stopped playing has this long to play again before its activities end
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
 ISBTV = isbtv.from_env(os.environ)  # None: skip sponsors is off
@@ -116,6 +121,8 @@ class Device(EventListener):
         self._playing = False
         self._played_video: str | None = None  # last video reported Playing
         self._stopped_at = 0.0  # when it last stopped being Playing (live.clock time)
+        self._end_task: asyncio.Task | None = None  # pending end of its activities (see _stopping)
+        self._end_why = ""  # what that end is for
 
     @property
     def video_id(self) -> str | None:
@@ -132,7 +139,7 @@ class Device(EventListener):
         log.info("%s now playing: video=%s state=%s", self.name, e.video_id, e.state.name)
         if e.video_id:
             self.video_id = e.video_id
-        self._note_state(e.state)
+        self._note_state(e.state, video=bool(e.video_id))
         if e.state == State.Playing:
             await self._auto_caption()
 
@@ -149,12 +156,22 @@ class Device(EventListener):
 
     async def disconnected(self, e):
         self._changed()  # pyytlounge drops the session right after this returns; the push is debounced
+        self._stopping("disconnected")
 
     # --- Live Activities (never raise, never block)
-    def _note_state(self, state):
+    def _note_state(self, state, video=True):
         """Starting to play: Playing a different video than the last one reported Playing, or the
-        first Playing since the session (re)connected or after PLAY_IDLE_S without Playing."""
+        first Playing since the session (re)connected or after PLAY_IDLE_S without Playing.
+        Stopping (see _stopping): the video ended, Stopped, or a nowPlaying with no video (`video`
+        false). Paused is neither."""
         try:
+            if state in (State.Playing, State.Starting):
+                self._playing_again(state.name)
+            elif state == State.Paused and video:
+                self._playing_again("Paused", connection_only=True)
+            elif state in (State.Buffering, State.Stopped) or not video:
+                # pyytlounge's Buffering is YouTube's state 0, "ended" (see pyytlounge/models.py)
+                self._stopping("no video" if not video else "ended" if state == State.Buffering else "stopped")
             now = live.clock()
             # Starting (YouTube's "buffering") counts too: after a session drop the TV may only
             # report a new video as Starting, with no later Playing event to catch.
@@ -176,6 +193,50 @@ class Device(EventListener):
             live.changed(self.owner, self.id)
         except Exception:
             log.exception("%s: live activity update failed", self.name)
+
+    CONNECTION = ("disconnected", "session ended", "session error")  # _stopping reasons
+
+    def _stopping(self, why: str):
+        """The TV stopped playing (why: ended, stopped, no video, or one of CONNECTION): end the
+        Live Activities showing it in LIVE_ACTIVITY_END_GRACE_S unless it plays again first (see
+        _playing_again). One pending end per TV: a second stop keeps the first one's deadline.
+        Nothing to do with pushes off or no activity showing it; ended() ends whatever shows it
+        when the grace is up."""
+        try:
+            if (not live.relay or (self._end_task and not self._end_task.done())
+                    or not live.showing(self.owner, self.id)):  # nothing to end
+                return
+            grace = LIVE_ACTIVITY_END_GRACE_S
+            log.info("%s stopped playing (%s): ending its Live Activities in %gs unless it plays again",
+                     self.name, why, grace)
+            self._end_why = why
+            self._end_task = asyncio.get_running_loop().create_task(self._end_later(grace))
+        except Exception:
+            log.exception("%s: live activity end check failed", self.name)
+
+    def _playing_again(self, state: str, connection_only=False):
+        """Playing or Starting (any video) cancels a pending end. So does Paused on a video, but
+        only an end for a dropped session (the TV came back, and Paused isn't stopping); an ended
+        or stopped video has to play again."""
+        task = self._end_task
+        if not task or task.done() or (connection_only and self._end_why not in self.CONNECTION):
+            return
+        task.cancel()
+        self._end_task = None
+        log.info("%s reported %s within the grace period: keeping its Live Activities (was: %s)",
+                 self.name, state, self._end_why)
+
+    async def _end_later(self, grace: float):
+        await asyncio.sleep(grace)
+        if self._end_task is asyncio.current_task():
+            self._end_task = None
+        try:
+            n = live.ended(self.owner, self.id, activity_state(self))
+            log.info("%s didn't play again within %gs (%s): ended %d Live Activit%s", self.name, grace,
+                     self._end_why, n, "y" if n == 1 else "ies")
+            self._fresh = True  # its next Playing (even of the same video) starts a new activity
+        except Exception:
+            log.exception("%s: ending live activities failed", self.name)
 
     async def set_speed(self, speed: float):
         """Set the speed and, if it changes, wait for the TV to apply it: a caption command
@@ -282,17 +343,21 @@ class Device(EventListener):
     async def stop(self):
         if self.task:
             self.task.cancel()
+        if self._end_task:
+            self._end_task.cancel()  # removing the TV ends its activities itself (live.removed)
         await self.api.close()
 
     async def _loop(self):
         """Keep connected + subscribed. Reconnects when the TV app closes or the token expires."""
         while True:
+            up = False  # this iteration's session connected
             try:
                 if not self.api.linked():
                     await self.api.refresh_auth()
                     save_devices()
                 was_connected = self.api.connected()
                 if await self.api.connect():
+                    up = True
                     if not was_connected:
                         self._fresh = True
                     if self.api.screen_name and self.name != self.api.screen_name:
@@ -303,10 +368,15 @@ class Device(EventListener):
                     await self.api.get_now_playing()
                     await self.api.subscribe()  # blocks until the session drops
                     log.info("session ended: %s", self.name)
+                    # Often routine: the next session's nowPlaying/Playing cancels this. Our own
+                    # _resubscribe() cancels this task instead, so it never gets here.
+                    self._stopping("session ended")
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
                 log.warning("%s session error: %s", self.name, ex)
+                if up:
+                    self._stopping("session error")
             self._changed()
             await asyncio.sleep(RECONNECT_S)  # TV off / app closed: retry quietly
 

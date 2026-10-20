@@ -13,6 +13,8 @@ Hooks from the TVs (all synchronous, never raise, never block: each push is its 
 - changed(owner, tv): debounced 0.5 s; `update` each install whose activity shows that TV, only if
   the content-state differs from the last one sent to that activity.
 - removed(owner, tv, state): `end` (dismissed now) each activity showing that TV, and forget it.
+- ended(owner, tv, state): the same, for a TV that stopped playing (main.py waits out a grace
+  period first); those installs' next start for that TV isn't held back by the 2 minutes.
 
 Relay answers: `unregistered` clears the token that was used; `failed` is logged and kept
 (BadDeviceToken usually means the install's environment is wrong, not a dead token).
@@ -237,11 +239,27 @@ class LiveActivities:
 
     def removed(self, owner: str, device_id: str, state: dict):
         """The person removed this TV: end and forget the activities showing it."""
+        self._end(owner, device_id, state)
+
+    def showing(self, owner: str, device_id: str) -> bool:
+        """Whether one of this person's installs has an activity showing that TV."""
+        return any(inst["owner"] == owner and inst["activity"] and inst["activity"]["device_id"] == device_id
+                   for inst in self.installs.values())
+
+    def ended(self, owner: str, device_id: str, state: dict) -> int:
+        """The TV stopped playing (and didn't play again within main's grace period): end and
+        forget the activities showing it, the same way as removed(). Those installs' next start
+        for this TV isn't held back by START_GAP_S. Returns how many activities were ended."""
+        return self._end(owner, device_id, state, restart=True)
+
+    def _end(self, owner: str, device_id: str, state: dict, restart=False) -> int:
+        """`end` (dismissed now, with this final content-state) each of this person's activities
+        showing that TV, and forget it. Never raises."""
+        n = 0
         try:
             task = self._debounce.pop((owner, device_id), None)
             if task:
                 task.cancel()
-            touched = False
             for iid, inst in self.installs.items():
                 act = inst["activity"]
                 if inst["owner"] != owner or not act or act["device_id"] != device_id:
@@ -251,11 +269,14 @@ class LiveActivities:
                         "event": "end", "content_state": state, "dismissal_date": int(self.clock())})
                 inst["activity"] = None
                 self._sent.pop(iid, None)
-                touched = True
-            if touched:
+                if restart:
+                    self._started.pop((iid, device_id), None)
+                n += 1
+            if n:
                 self.save()
         except Exception:
-            log.exception("removed failed")
+            log.exception("ending activities for %s failed", device_id[:8])
+        return n
 
     # --- sending
     def _update(self, iid: str, force=False):

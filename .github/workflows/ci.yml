@@ -39,6 +39,8 @@ jobs:
         run: python -I tests/test_resubscribe.py
       - name: test_settings
         run: python -I tests/test_settings.py
+      - name: test_live_end
+        run: python -I tests/test_live_end.py
 
   compose:
     runs-on: ubuntu-latest
