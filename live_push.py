@@ -183,13 +183,22 @@ class LiveActivities:
             if not state:
                 return
             now = self.clock()
+            mine = [iid for iid, inst in self.installs.items() if inst["owner"] == owner]
+            if not mine:
+                log.info("%s started playing: no installs registered for its owner", device_id[:8])
             for iid, inst in self.installs.items():
-                if inst["owner"] != owner or inst["environment"] not in ENVIRONMENTS:
+                if inst["owner"] != owner:
+                    continue
+                if inst["environment"] not in ENVIRONMENTS:
+                    log.info("install %s: no environment yet, not pushing", iid[:8])
                     continue
                 act = inst["activity"]
                 if act and act["device_id"] == device_id and now - act["since"] < ACTIVITY_MAX_AGE_S:
+                    log.info("install %s: activity already shows %s, updating", iid[:8], device_id[:8])
                     self._update(iid, force=True)
-                elif inst["push_to_start_token"]:
+                elif not inst["push_to_start_token"]:
+                    log.info("install %s: no push-to-start token, can't start an activity", iid[:8])
+                else:
                     if now - self._started.get((iid, device_id), float("-inf")) < START_GAP_S:
                         log.info("install %s: not starting another activity for %s yet", iid[:8], device_id[:8])
                         continue

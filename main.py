@@ -87,6 +87,7 @@ class Device(EventListener):
 
     # --- events from the TV
     async def now_playing_changed(self, e):
+        log.info("%s now playing: video=%s state=%s", self.name, e.video_id, e.state.name)
         if e.video_id:
             self.video_id = e.video_id
         self._note_state(e.state)
@@ -94,6 +95,7 @@ class Device(EventListener):
             await self._auto_caption()
 
     async def playback_state_changed(self, e):
+        log.info("%s state: %s (video=%s)", self.name, e.state.name, self.video_id)
         self._note_state(e.state)
         if e.state == State.Playing:
             await self._auto_caption()
@@ -112,7 +114,9 @@ class Device(EventListener):
         first Playing since the session (re)connected or after PLAY_IDLE_S without Playing."""
         try:
             now = live.clock()
-            if state != State.Playing:
+            # Starting (YouTube's "buffering") counts too: after a session drop the TV may only
+            # report a new video as Starting, with no later Playing event to catch.
+            if state not in (State.Playing, State.Starting):
                 if self._playing:
                     self._playing, self._stopped_at = False, now
                 return
@@ -120,6 +124,7 @@ class Device(EventListener):
                       or (not self._playing and now - self._stopped_at >= PLAY_IDLE_S))
             self._fresh, self._playing, self._played_video = False, True, self.video_id
             if starts:
+                log.info("%s starts playing %s", self.name, self.video_id)
                 live.started_playing(self.owner, self.id)
         except Exception:
             log.exception("%s: live activity start check failed", self.name)
