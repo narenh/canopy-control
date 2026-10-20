@@ -190,6 +190,7 @@ async def set_speed(device_id: str, speed: float):
         raise HTTPException(400, f"speed must be one of {sorted(SPEEDS)}")
     d = get(device_id)
     await d.api.set_playback_speed(speed)
+    d.speed = speed  # don't wait for the TV's event; callers render the response
     if d.video_id:
         await d.api.set_closed_captions(CAPTION_LANG if speed > 1 else None, d.video_id)
         d.captions = speed > 1
