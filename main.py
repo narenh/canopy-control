@@ -65,6 +65,9 @@ CANOPY_APNS_URL = (os.environ.get("CANOPY_APNS_URL") or "").strip() or live_push
 CANOPY_APNS_KEY = (os.environ.get("CANOPY_APNS_KEY") or "").strip()
 CANOPY_CONTROL_BUNDLE_ID = (os.environ.get("CANOPY_CONTROL_BUNDLE_ID") or "").strip() or live_push.DEFAULT_BUNDLE_ID
 RECONNECT_S = 10  # wait between Lounge connection attempts
+# Log every raw Lounge event from the TV (type and a truncated payload), for diagnosing what
+# the TV actually reports. On by default while Live Activity starts are being debugged.
+LOG_LOUNGE_EVENTS = (os.environ.get("LOG_LOUNGE_EVENTS") or "1").strip().lower() not in ("0", "false", "no", "off")
 PLAY_IDLE_S = 30 * 60  # Playing again after this long without counts as starting to play
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
@@ -82,6 +85,8 @@ class Device(EventListener):
         self.custom_name = custom_name  # what its owner renamed it to, if they did
         self.skip_sponsors = skip_sponsors  # its owner wants iSponsorBlockTV on it
         self.api = YtLoungeApi("Speed Remote", self)
+        if LOG_LOUNGE_EVENTS:
+            self._log_raw_events()
         self.task: asyncio.Task | None = None
         self.video_id: str | None = None
         self.speed = 1.0
@@ -160,8 +165,30 @@ class Device(EventListener):
         self.speed = speed  # callers render the response, even if the TV's event is late
         self._changed()
 
+    def _log_raw_events(self):
+        """Wrap pyytlounge's event dispatch to log what the TV sends before it's interpreted."""
+        dispatch = getattr(self.api, "_process_event", None)
+        if dispatch is None:  # a pyytlounge without it (or a test fake): nothing to wrap
+            return
+
+        async def logged(event_type, args):
+            if event_type != "noop":
+                try:
+                    payload = "" if event_type == "loungeStatus" else json.dumps(args, default=str)[:400]
+                except Exception:
+                    payload = "?"
+                log.info("%s lounge event %s %s", self.name, event_type, payload)
+            return await dispatch(event_type, args)
+
+        self.api._process_event = logged
+
     async def subtitles_track_changed(self, e):
         log.info("%s captions: video=%s lang=%r kind=%r", self.name, e.video_id, e.language_code, e.kind)
+        # The TV sometimes reports nowPlaying with no video (e.g. after a reconnect) while this
+        # event names the one on screen.
+        if e.video_id and e.video_id != self.video_id:
+            log.info("%s video from captions event: %s (was %s)", self.name, e.video_id, self.video_id)
+            self.video_id = e.video_id
         self.captions = bool(e.language_code)
         self._captions_changed.set()
         self._changed()
