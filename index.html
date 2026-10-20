@@ -17,17 +17,21 @@
   #cc { display: flex; align-items: center; justify-content: center; gap: .75rem; margin-top: 2rem; font-size: 1.3rem; }
   #cc input { width: 1.8rem; height: 1.8rem; accent-color: #e33; }
   #msg { min-height: 1.5em; opacity: .7; margin-top: 1.5rem; }
-  #pair { display: none; margin-top: 1rem; gap: .5rem; justify-content: center; }
+  #pairbtn { position: fixed; top: calc(env(safe-area-inset-top, 0px) + .75rem); right: max(1rem, env(safe-area-inset-right, 0px));
+             font-size: .9rem; padding: .35rem .8rem; }
+  #pair { display: none; margin-bottom: 1.5rem; gap: .5rem; justify-content: center; }
   #pair input, #pair button { font-size: 1.1rem; padding: .5rem; }
   .off { opacity: .35; pointer-events: none; }
 </style></head>
-<body><main>
+<body>
+<button id="pairbtn">Pair</button>
+<main>
+  <form id="pair"><input id="code" placeholder="TV link code" inputmode="numeric"><button>Pair</button><button type="button" id="cancel">Cancel</button></form>
   <div id="bar">
     <span id="dot"></span>
     <select id="dev"></select>
     <button id="rm">Remove</button>
   </div>
-  <form id="pair"><input id="code" placeholder="TV link code" inputmode="numeric"><button>Pair</button></form>
   <div id="ctl">
     <div id="val">1×</div>
     <input id="s" type="range" min="0" max="4" step="1" value="0">
@@ -37,7 +41,7 @@
   <div id="msg"></div>
 </main>
 <script>
-const S = [1, 1.25, 1.5, 1.75, 2], ADD = '__add', $ = id => document.getElementById(id);
+const S = [1, 1.25, 1.5, 1.75, 2], $ = id => document.getElementById(id);
 let sent = 0, cur = null;
 try { cur = localStorage.getItem('dev'); } catch {}
 const show = i => $('val').textContent = S[i] + '×';
@@ -55,20 +59,19 @@ function select(id) {
 
 async function refresh(force) {
   const list = await (await fetch('devices')).json();
-  if (cur !== ADD && !list.some(d => d.id === cur)) cur = list[0]?.id ?? ADD;
+  if (!list.some(d => d.id === cur)) cur = list[0]?.id ?? null;
   const sel = $('dev');
   if (document.activeElement !== sel) {
-    sel.innerHTML = list.map(d => `<option value="${d.id}">${d.name.replace(/</g, '&lt;')}</option>`).join('')
-                  + `<option value="${ADD}">+ Add TV…</option>`;
-    sel.value = cur;
+    sel.innerHTML = list.map(d => `<option value="${d.id}">${d.name.replace(/</g, '&lt;')}</option>`).join('');
+    if (cur) sel.value = cur;
   }
-  const d = list.find(d => d.id === cur), adding = cur === ADD;
-  $('pair').style.display = adding ? 'flex' : 'none';
-  $('rm').style.display = adding ? 'none' : '';
+  const d = list.find(d => d.id === cur);
+  $('bar').style.display = d ? '' : 'none';
   $('ctl').classList.toggle('off', !d?.connected);
   $('dot').classList.toggle('on', !!d?.connected);
-  if (adding) return say(list.length ? '' : 'Pair a TV: YouTube → Settings → Link with TV code');
-  if (!d.connected && !$('msg').textContent.startsWith('Pair')) say('Waiting for YouTube on ' + d.name + '…');
+  if (!d) { if (!pairing()) say('No TVs yet. Tap Pair to add one.'); return; }
+  if (pairing()) { /* keep the pairing hint */ }
+  else if (!d.connected) say('Waiting for YouTube on ' + d.name + '…');
   else if (d.connected && $('msg').textContent.startsWith('Waiting')) say('');
   const i = S.indexOf(d.speed);
   if (i >= 0 && (force || document.activeElement !== $('s'))) { $('s').value = sent = i; show(i); }
@@ -90,13 +93,22 @@ $('rm').onclick = async () => {
   await fetch(`devices/${encodeURIComponent(cur)}`, { method: 'DELETE' });
   cur = null; refresh(true);
 };
+const pairing = () => $('pair').style.display === 'flex';
+function showPair(on) {
+  $('pair').style.display = on ? 'flex' : 'none';
+  $('pairbtn').textContent = on ? 'Close' : 'Pair';
+  if (on) { say('On the TV: YouTube → Settings → Link with TV code'); $('code').focus(); }
+  else { $('code').value = ''; say(''); refresh(); }
+}
+$('pairbtn').onclick = () => showPair(!pairing());
+$('cancel').onclick = () => showPair(false);
 $('pair').onsubmit = async e => {
   e.preventDefault();
   const r = await fetch('pair', { method: 'POST', headers: {'Content-Type': 'application/json'},
                                   body: JSON.stringify({ code: $('code').value }) });
   if (!r.ok) return say('Pairing failed');
-  $('code').value = ''; say('');
-  select((await r.json()).id);
+  const id = (await r.json()).id;
+  showPair(false); select(id);
 };
 refresh(true); setInterval(refresh, 3000);
 </script>

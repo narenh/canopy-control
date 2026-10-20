@@ -2,7 +2,7 @@
 
 Self-hosted playback-speed remote for YouTube on a TV. Uses the unofficial YouTube Lounge API (via `pyytlounge`) to hold sessions to one or more paired TVs.
 
-- `/` — web UI: TV switcher at the top, slider 1x / 1.25 / 1.5 / 1.75 / 2x, captions checkbox
+- `/` — web UI: TV switcher at the top, Pair button top right, slider 1x / 1.25 / 1.5 / 1.75 / 2x, captions checkbox
 - `GET /devices` — paired TVs with connection and playback state
 - `POST /pair {"code": "..."}` — add a TV (YouTube → Settings → Link with TV code)
 - `DELETE /devices/{id}` — forget a TV
