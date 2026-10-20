@@ -324,7 +324,9 @@ with TestClient(main.app) as c:
     check("I2 activity on the den", [x["content_state"]["connected"] for x in bodies()] == [True])
     T[0] += 130; play(DEN, "x1"); drain(); b = bodies()
     check("den starts: I2 update, I1 start", sorted((x["event"], x["device_token"]) for x in b) == [("start", PTS1), ("update", ACT2)], b)
-    T[0] += 10; pause(DEN); resume(DEN); drain(); check("pause/resume: nothing", take() == [])
+    T[0] += 10; pause(DEN); resume(DEN); drain(); b = bodies()
+    check("pause/resume: counts as starting again: the showing activity gets an update, and no "
+          "second start within the start limit", sorted((x["event"], x["device_token"]) for x in b) == [("update", ACT2)], b)
     DEN.api.live = False; DEN.api.sid = False
     run(DEN.disconnected, ev()); run(DEN.api.drop.set)
     time.sleep(0.2); drain(); b = bodies()
@@ -339,11 +341,16 @@ with TestClient(main.app) as c:
           sorted((x["event"], x["device_token"]) for x in b) == [("start", PTS1), ("update", ACT2)], b)
     check("start alert uses the new name", next(x for x in b if x["event"] == "start")["alert"]["title"] == "Den TV")
 
-    # ---------- 30 minutes without Playing
-    T[0] += 130; pause(DEN); T[0] += 29 * 60; resume(DEN); drain()
-    check("Playing again after 29 min: nothing", take() == [])
-    pause(DEN); T[0] += 30 * 60; resume(DEN); drain(); b = bodies()
-    check("Playing again after 30 min: counts as starting", sorted((x["event"], x["device_token"]) for x in b) == [("start", PTS1), ("update", ACT2)], b)
+    # ---------- resuming after a pause (past the start limit): start where none shows, update where one does
+    T[0] += 130; pause(DEN); T[0] += 29 * 60; resume(DEN); drain(); b = bodies()
+    check("resume after a long pause: I1 start, I2 update", sorted((x["event"], x["device_token"]) for x in b) == [("start", PTS1), ("update", ACT2)], b)
+
+    # ---------- 30 minutes without Playing (the video ended; not a pause)
+    def ended(d): run(d.playback_state_changed, ev(state=State.Buffering))
+    T[0] += 130; ended(DEN); T[0] += 29 * 60; resume(DEN); drain()
+    check("Playing again 29 min after it ended: nothing", take() == [])
+    ended(DEN); T[0] += 30 * 60; resume(DEN); drain(); b = bodies()
+    check("Playing again 30 min after it ended: counts as starting", sorted((x["event"], x["device_token"]) for x in b) == [("start", PTS1), ("update", ACT2)], b)
 
     # ---------- end on TV removal
     put(I3, {"activity": {"token": ACT4, "device_id": "scr-BR"}}, who="B"); drain(); take()

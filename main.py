@@ -119,6 +119,7 @@ class Device(EventListener):
         # for Live Activities: when this TV "starts playing" (see _note_state)
         self._fresh = True  # no Playing seen since the session (re)connected
         self._playing = False
+        self._paused = False  # last reported state was Paused (on a video)
         self._played_video: str | None = None  # last video reported Playing
         self._stopped_at = 0.0  # when it last stopped being Playing (live.clock time)
         self._end_task: asyncio.Task | None = None  # pending end of its activities (see _stopping)
@@ -163,8 +164,12 @@ class Device(EventListener):
         """Starting to play: Playing a different video than the last one reported Playing, or the
         first Playing since the session (re)connected or after PLAY_IDLE_S without Playing.
         Stopping (see _stopping): the video ended, Stopped, or a nowPlaying with no video (`video`
-        false). Paused is neither."""
+        false). Paused is neither, but playing again after a pause counts as starting: if the
+        Live Activity never showed up (or was swiped away), unpausing brings it back; if it's
+        showing, it just gets an update (live.started_playing decides, and rate-limits starts)."""
         try:
+            resumed = self._paused and state in (State.Playing, State.Starting)
+            self._paused = state == State.Paused and video
             if state in (State.Playing, State.Starting):
                 self._playing_again(state.name)
             elif state == State.Paused and video:
@@ -179,11 +184,11 @@ class Device(EventListener):
                 if self._playing:
                     self._playing, self._stopped_at = False, now
                 return
-            starts = (self._fresh or self.video_id != self._played_video
+            starts = (self._fresh or self.video_id != self._played_video or resumed
                       or (not self._playing and now - self._stopped_at >= PLAY_IDLE_S))
             self._fresh, self._playing, self._played_video = False, True, self.video_id
             if starts:
-                log.info("%s starts playing %s", self.name, self.video_id)
+                log.info("%s %s %s", self.name, "resumes" if resumed else "starts playing", self.video_id)
                 live.started_playing(self.owner, self.id)
         except Exception:
             log.exception("%s: live activity start check failed", self.name)
