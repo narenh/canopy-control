@@ -132,9 +132,16 @@ class Device(EventListener):
 
     @video_id.setter
     def video_id(self, v: str | None):
-        if v != self._video_id:
-            titles.want(v)  # in the background: info() shows the title once it's known
+        if v == self._video_id:
+            return
+        titles.want(v)  # in the background: info() shows the title once it's known
         self._video_id = v
+        # Kept in devices.json: after a restart a TV may not say what it's playing until something
+        # changes (it answers getNowPlaying with no video), so the app would show nothing playing.
+        try:
+            save_devices()
+        except Exception:
+            log.exception("%s: couldn't save its video", self.display_name)
 
     # --- events from the TV
     async def now_playing_changed(self, e):
@@ -443,6 +450,7 @@ def save_devices():
     DEVICES_FILE.write_text(json.dumps(
         [{"owner": d.owner, "name": d.name, **({"custom_name": d.custom_name} if d.custom_name else {}),
           **({"skip_sponsors": True} if d.skip_sponsors else {}),
+          **({"video_id": d.video_id} if d.video_id else {}),
           "auth": d.api.auth.serialize()} for d in devices.values()],
         indent=1))
     render_isbtv()
@@ -531,6 +539,8 @@ def load_devices() -> tuple[list[Device], int]:
         custom = entry.get("custom_name")
         d = Device(owner, entry.get("name", "TV"), custom if isinstance(custom, str) and custom else None,
                    entry.get("skip_sponsors") is True)
+        video = entry.get("video_id")
+        d._video_id = video if isinstance(video, str) and video else None  # what it last reported
         try:
             d.api.load_auth_state(_normalize_auth(entry["auth"]))
             out.append(d)

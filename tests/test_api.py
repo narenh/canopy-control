@@ -62,7 +62,7 @@ ready.wait(5)
 DATA = Path(tempfile.mkdtemp())
 (DATA / "devices.json").write_text(json.dumps([
     {"name": "Old TV", "auth": {"version": 1, "screenId": "scr-legacy"}},
-    {"owner": PERSON_A["id"], "name": "Saved TV", "auth": {"version": 1, "screenId": "scr-saved"}},
+    {"owner": PERSON_A["id"], "name": "Saved TV", "video_id": "vid-saved", "auth": {"version": 1, "screenId": "scr-saved"}},
 ]))
 os.environ.update(DATA_DIR=str(DATA), CANOPY_ACCOUNT_URL=f"http://127.0.0.1:{PORT}/", CANOPY_ACCOUNT_KEY=SITE_KEY)
 
@@ -124,8 +124,14 @@ with TestClient(main.app) as c:
     # --- legacy entries dropped and file rewritten
     saved = json.loads((DATA / "devices.json").read_text())
     check("legacy entry dropped from devices.json", saved == [
-        {"owner": PERSON_A["id"], "name": "Saved TV", "auth": {"version": 1, "screenId": "scr-saved"}}], saved)
+        {"owner": PERSON_A["id"], "name": "Saved TV", "video_id": "vid-saved", "auth": {"version": 1, "screenId": "scr-saved"}}], saved)
     check("legacy device not loaded", set(main.devices) == {(PERSON_A["id"], "scr-saved")}, main.devices)
+    # --- the last video survives a restart, and a new one is saved
+    saved_tv = main.devices[(PERSON_A["id"], "scr-saved")]
+    check("saved video loaded", saved_tv.video_id == "vid-saved", saved_tv.video_id)
+    saved_tv.video_id = "vid-next"
+    check("new video saved", json.loads((DATA / "devices.json").read_text())[0].get("video_id") == "vid-next")
+    saved_tv.video_id = None  # the rest of this file expects no video on it
 
     # --- 401 / 403
     r = c.get("/devices"); check("401 without a token", *err(r, 401, "signed_out"))

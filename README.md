@@ -130,7 +130,7 @@ Locally (nothing is published on the host; add a `ports: ["127.0.0.1:8000:8000"]
 CANOPY_ACCOUNT_KEY=cnp_... docker compose up -d --build
 ```
 
-Pairings persist in `devices.json` on the `api-data` volume (`/data`), each with its owner's Canopy person id, any custom name (`custom_name`, next to the TV's own `name`) and `skip_sponsors` when on. Entries from before accounts (no owner), and an old single-TV `auth.json`, are dropped at startup with a warning: re-pair those TVs from the app.
+Pairings persist in `devices.json` on the `api-data` volume (`/data`), each with its owner's Canopy person id, any custom name (`custom_name`, next to the TV's own `name`), `skip_sponsors` when on, and the last video the TV reported (`video_id`, so a restart doesn't show a playing TV as having nothing on until it reports again). Entries from before accounts (no owner), and an old single-TV `auth.json`, are dropped at startup with a warning: re-pair those TVs from the app.
 
 ### Coolify: switching to the Docker Compose build pack
 
