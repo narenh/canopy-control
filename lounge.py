@@ -8,7 +8,14 @@ clashed the same way. This sends a stable id per (person, TV) instead.
 
 connect() below is pyytlounge 3.4.0's, unchanged but for "id". tests/test_lounge.py fails if a
 pyytlounge upgrade changes the original, so an automatic upgrade can't silently drop this.
+
+Two more things iSponsorBlockTV's YtLoungeApi does that pyytlounge doesn't: commands go out one at a
+time (each takes the next "ofs"/"RID", and concurrent ones could reach YouTube out of order), and
+last_event_at says when the TV last sent anything, keepalive noops included, so a session that has
+gone quiet can be told from one that's alive (see Device._subscribe in main.py).
 """
+import asyncio
+import time
 import uuid
 
 from pyytlounge import YtLoungeApi
@@ -23,11 +30,21 @@ class LoungeApi(YtLoungeApi):
     def __init__(self, device_name: str, listener, remote_key: str):
         super().__init__(device_name, listener)
         self.remote_key = remote_key  # who this session is for (a Canopy person id)
+        self.last_event_at = time.monotonic()
+        self._command_lock = asyncio.Lock()
 
     @property
     def remote_id(self) -> str:
         """Stable across restarts and reconnects, distinct per person and TV."""
         return str(uuid.uuid5(REMOTE_ID_NAMESPACE, f"{self.remote_key}:{self.auth.screen_id}"))
+
+    async def _process_events(self, events):
+        self.last_event_at = time.monotonic()
+        return await super()._process_events(events)
+
+    async def _command(self, command, command_parameters=None):
+        async with self._command_lock:
+            return await super()._command(command, command_parameters)
 
     async def connect(self) -> bool:
         if not self.linked():

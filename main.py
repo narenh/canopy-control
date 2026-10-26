@@ -83,7 +83,8 @@ CANOPY_ACCOUNT_KEY = (os.environ.get("CANOPY_ACCOUNT_KEY") or "").strip()
 CANOPY_APNS_URL = (os.environ.get("CANOPY_APNS_URL") or "").strip() or live_push.DEFAULT_URL
 CANOPY_APNS_KEY = (os.environ.get("CANOPY_APNS_KEY") or "").strip()
 CANOPY_CONTROL_BUNDLE_ID = (os.environ.get("CANOPY_CONTROL_BUNDLE_ID") or "").strip() or live_push.DEFAULT_BUNDLE_ID
-RECONNECT_S = 10  # wait between Lounge connection attempts
+RECONNECT_S = 10  # wait between failed Lounge connection attempts (a routine session end reconnects at once)
+EVENT_SILENCE_S = 60  # the TV sends something at least every 30 s: this long with nothing, the session is dead
 # Log every raw Lounge event from the TV (type and a truncated payload), for diagnosing what
 # the TV actually reports. On by default while Live Activity starts are being debugged.
 LOG_LOUNGE_EVENTS = (os.environ.get("LOG_LOUNGE_EVENTS") or "1").strip().lower() not in ("0", "false", "no", "off")
@@ -380,6 +381,7 @@ class Device(EventListener):
         """Keep connected + subscribed. Reconnects when the TV app closes or the token expires."""
         while True:
             up = False  # this iteration's session connected
+            started = time.monotonic()
             try:
                 if not self.api.linked():
                     await self.api.refresh_auth()
@@ -395,7 +397,7 @@ class Device(EventListener):
                     log.info("connected to %s (TV %s)", self.display_name, self.id[:8])
                     self._changed()
                     await self.api.get_now_playing()
-                    await self.api.subscribe()  # blocks until the session drops
+                    await self._subscribe()  # blocks until the session drops
                     log.info("session ended: %s", self.display_name)
                     # Often routine: the next session's nowPlaying/Playing cancels this. Our own
                     # _resubscribe() cancels this task instead, so it never gets here.
@@ -407,7 +409,29 @@ class Device(EventListener):
                 if up:
                     self._stopping("session error")
             self._changed()
-            await asyncio.sleep(RECONNECT_S)  # TV off / app closed: retry quietly
+            # YouTube ends sessions every few minutes. Reconnect at once after one that lasted: the
+            # TV announces a video only when it starts (asked later, it may answer with no video),
+            # so one that starts while we're away is missed. Wait only after a failed or short one
+            # (TV off, app closed), so a session that keeps failing doesn't spin.
+            if not up or time.monotonic() - started < RECONNECT_S:
+                await asyncio.sleep(RECONNECT_S)
+
+    async def _subscribe(self):
+        """api.subscribe(), but give up on it once the TV has sent nothing for EVENT_SILENCE_S: a
+        subscription can stay open long after its session died, and we'd hear nothing until a
+        command failed (iSponsorBlockTV's watchdog does the same)."""
+        sub = asyncio.ensure_future(self.api.subscribe())
+        try:
+            while not sub.done():
+                await asyncio.wait({sub}, timeout=EVENT_SILENCE_S / 4)
+                last = getattr(self.api, "last_event_at", None)
+                if not sub.done() and last is not None and time.monotonic() - last > EVENT_SILENCE_S:
+                    log.warning("%s: nothing from the TV for %ds; starting a fresh session",
+                                self.display_name, time.monotonic() - last)
+                    return
+            sub.result()  # its exception, if it raised
+        finally:
+            sub.cancel()
 
     def info(self) -> dict:
         titles.want(self.video_id)  # no-op unless it's not cached yet or a failure has expired
