@@ -138,7 +138,7 @@ class Device(EventListener):
 
     # --- events from the TV
     async def now_playing_changed(self, e):
-        log.info("%s now playing: video=%s state=%s", self.name, e.video_id, e.state.name)
+        log.info("%s now playing: video=%s state=%s", self.display_name, e.video_id, e.state.name)
         if e.video_id:
             self.video_id = e.video_id
         self._note_state(e.state, video=bool(e.video_id))
@@ -146,7 +146,7 @@ class Device(EventListener):
             await self._auto_caption()
 
     async def playback_state_changed(self, e):
-        log.info("%s state: %s (video=%s)", self.name, e.state.name, self.video_id)
+        log.info("%s state: %s (video=%s)", self.display_name, e.state.name, self.video_id)
         self._note_state(e.state)
         if e.state == State.Playing:
             await self._auto_caption()
@@ -189,16 +189,16 @@ class Device(EventListener):
                       or (not self._playing and now - self._stopped_at >= PLAY_IDLE_S))
             self._fresh, self._playing, self._played_video = False, True, self.video_id
             if starts:
-                log.info("%s %s %s", self.name, "resumes" if resumed else "starts playing", self.video_id)
+                log.info("%s %s %s", self.display_name, "resumes" if resumed else "starts playing", self.video_id)
                 live.started_playing(self.owner, self.id)
         except Exception:
-            log.exception("%s: live activity start check failed", self.name)
+            log.exception("%s: live activity start check failed", self.display_name)
 
     def _changed(self):
         try:
             live.changed(self.owner, self.id)
         except Exception:
-            log.exception("%s: live activity update failed", self.name)
+            log.exception("%s: live activity update failed", self.display_name)
 
     CONNECTION = ("disconnected", "session ended", "session error")  # _stopping reasons
 
@@ -214,11 +214,11 @@ class Device(EventListener):
                 return
             grace = LIVE_ACTIVITY_END_GRACE_S
             log.info("%s stopped playing (%s): ending its Live Activities in %gs unless it plays again",
-                     self.name, why, grace)
+                     self.display_name, why, grace)
             self._end_why = why
             self._end_task = asyncio.get_running_loop().create_task(self._end_later(grace))
         except Exception:
-            log.exception("%s: live activity end check failed", self.name)
+            log.exception("%s: live activity end check failed", self.display_name)
 
     def _playing_again(self, state: str, connection_only=False):
         """Playing or Starting (any video) cancels a pending end. So does Paused on a video, but
@@ -230,7 +230,7 @@ class Device(EventListener):
         task.cancel()
         self._end_task = None
         log.info("%s reported %s within the grace period: keeping its Live Activities (was: %s)",
-                 self.name, state, self._end_why)
+                 self.display_name, state, self._end_why)
 
     async def _end_later(self, grace: float):
         await asyncio.sleep(grace)
@@ -238,11 +238,11 @@ class Device(EventListener):
             self._end_task = None
         try:
             n = live.ended(self.owner, self.id, activity_state(self))
-            log.info("%s didn't play again within %gs (%s): ended %d Live Activit%s", self.name, grace,
+            log.info("%s didn't play again within %gs (%s): ended %d Live Activit%s", self.display_name, grace,
                      self._end_why, n, "y" if n == 1 else "ies")
             self._fresh = True  # its next Playing (even of the same video) starts a new activity
         except Exception:
-            log.exception("%s: ending live activities failed", self.name)
+            log.exception("%s: ending live activities failed", self.display_name)
 
     async def set_speed(self, speed: float):
         """Set the speed and, if it changes, wait for the TV to apply it: a caption command
@@ -254,7 +254,7 @@ class Device(EventListener):
             try:
                 await asyncio.wait_for(self._speed_changed.wait(), CAPTION_WAIT)
             except asyncio.TimeoutError:
-                log.warning("%s: TV didn't report a speed change to %s", self.name, speed)
+                log.warning("%s: TV didn't report a speed change to %s", self.display_name, speed)
                 self._resubscribe()
         self.speed = speed  # callers render the response, even if the TV's event is late
         self._changed()
@@ -271,17 +271,17 @@ class Device(EventListener):
                     payload = "" if event_type == "loungeStatus" else json.dumps(args, default=str)[:400]
                 except Exception:
                     payload = "?"
-                log.info("%s lounge event %s %s", self.name, event_type, payload)
+                log.info("%s lounge event %s %s", self.display_name, event_type, payload)
             return await dispatch(event_type, args)
 
         self.api._process_event = logged
 
     async def subtitles_track_changed(self, e):
-        log.info("%s captions: video=%s lang=%r kind=%r", self.name, e.video_id, e.language_code, e.kind)
+        log.info("%s captions: video=%s lang=%r kind=%r", self.display_name, e.video_id, e.language_code, e.kind)
         # The TV sometimes reports nowPlaying with no video (e.g. after a reconnect) while this
         # event names the one on screen.
         if e.video_id and e.video_id != self.video_id:
-            log.info("%s video from captions event: %s (was %s)", self.name, e.video_id, self.video_id)
+            log.info("%s video from captions event: %s (was %s)", self.display_name, e.video_id, self.video_id)
             self.video_id = e.video_id
         self.captions = bool(e.language_code)
         self._captions_changed.set()
@@ -299,7 +299,7 @@ class Device(EventListener):
             raise
         except Exception as ex:
             why = str(ex) or type(ex).__name__
-        log.warning("%s: %s command failed: %s", self.name, what, why)
+        log.warning("%s: %s command failed: %s", self.display_name, what, why)
         self._resubscribe()
         raise HTTPException(503, f"{self.display_name} isn't answering. Reconnecting; try again in a few seconds.")
 
@@ -321,7 +321,7 @@ class Device(EventListener):
             # Don't wait for the change here: the TV's reply arrives through this same event loop.
             await self._send_captions(self.want_captions)
         except Exception as ex:
-            log.warning("%s auto-captions failed: %s", self.name, ex)
+            log.warning("%s auto-captions failed: %s", self.display_name, ex)
 
     async def set_captions(self, on: bool):
         """Ask the TV for captions; if that's a change, wait for the TV to confirm it."""
@@ -333,7 +333,7 @@ class Device(EventListener):
             try:
                 await asyncio.wait_for(self._captions_changed.wait(), CAPTION_WAIT)
             except asyncio.TimeoutError:
-                log.warning("%s: TV didn't report a caption change for %s", self.name, self.video_id)
+                log.warning("%s: TV didn't report a caption change for %s", self.display_name, self.video_id)
                 self._resubscribe()
 
     # --- lifecycle
@@ -358,7 +358,7 @@ class Device(EventListener):
         if now - self._resubscribed_at < RESUBSCRIBE_GAP_S or not self.task:
             return
         self._resubscribed_at = now
-        log.warning("%s: events stopped arriving; starting a fresh session", self.name)
+        log.warning("%s: events stopped arriving; starting a fresh session", self.display_name)
         self.task.cancel()
         self.task = asyncio.create_task(self._loop())
 
@@ -385,18 +385,18 @@ class Device(EventListener):
                     if self.api.screen_name and self.name != self.api.screen_name:
                         self.name = self.api.screen_name
                         save_devices()
-                    log.info("connected to %s", self.name)
+                    log.info("connected to %s (TV %s)", self.display_name, self.id[:8])
                     self._changed()
                     await self.api.get_now_playing()
                     await self.api.subscribe()  # blocks until the session drops
-                    log.info("session ended: %s", self.name)
+                    log.info("session ended: %s", self.display_name)
                     # Often routine: the next session's nowPlaying/Playing cancels this. Our own
                     # _resubscribe() cancels this task instead, so it never gets here.
                     self._stopping("session ended")
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
-                log.warning("%s session error: %s", self.name, ex)
+                log.warning("%s session error: %s", self.display_name, ex)
                 if up:
                     self._stopping("session error")
             self._changed()
