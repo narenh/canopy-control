@@ -21,7 +21,8 @@ PUT    /installs/{uuid}           - an app install's Live Activity tokens (see b
 DELETE /installs/{uuid}           - forget an install (the app's sign-out)
 
 Errors are JSON {"detail": "<sentence>"}, plus "reason" for: 401 signed_out, 403 email_unverified,
-503 account_unreachable, 409 too_many_devices, 403 skip_not_allowed.
+503 account_unreachable, 409 too_many_devices, 403 skip_not_allowed. A speed or caption command
+that doesn't reach the TV is a 503 (and starts a fresh Lounge session), not a 500.
 
 Titles (oembed.py): "title" and "channel" are the TV's current video's, from YouTube's public oEmbed
 endpoint, fetched in the background when the video changes and cached per video id; null until
@@ -248,7 +249,7 @@ class Device(EventListener):
         sent while the TV is still changing speed gets dropped."""
         changing = speed != self.speed
         self._speed_changed.clear()
-        await self.api.set_playback_speed(speed)
+        await self._send("speed", self.api.set_playback_speed(speed))
         if changing:
             try:
                 await asyncio.wait_for(self._speed_changed.wait(), CAPTION_WAIT)
@@ -286,14 +287,30 @@ class Device(EventListener):
         self._captions_changed.set()
         self._changed()
 
+    async def _send(self, what: str, command):
+        """Await a Lounge command. If it didn't reach the TV (pyytlounge raised: no session,
+        YouTube refused it, the network failed; or returned False: YouTube said the session is
+        gone), start a fresh session and raise a 503 for the route to answer with (not a bare 500)."""
+        try:
+            if await command is not False:
+                return
+            why = "the Lounge session is gone"
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            why = str(ex) or type(ex).__name__
+        log.warning("%s: %s command failed: %s", self.name, what, why)
+        self._resubscribe()
+        raise HTTPException(503, f"{self.display_name} isn't answering. Reconnecting; try again in a few seconds.")
+
     # --- captions
     async def _send_captions(self, on: bool):
         if on:
-            await self.api.set_closed_captions(CAPTION_LANG, self.video_id)
+            await self._send("captions", self.api.set_closed_captions(CAPTION_LANG, self.video_id))
         else:
             # pyytlounge sends languageCode="" for off, which the TV ignores. YouTube's own remote
             # (player remote.js) sends setSubtitlesTrack with only the videoId.
-            await self.api._command("setSubtitlesTrack", {"videoId": self.video_id})
+            await self._send("captions", self.api._command("setSubtitlesTrack", {"videoId": self.video_id}))
 
     async def _auto_caption(self):
         """The TV keeps the speed across videos but not captions, so re-apply the last choice per video."""

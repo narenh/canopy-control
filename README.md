@@ -33,7 +33,7 @@ Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 | 409 | `too_many_devices` | pairing an 11th TV |
 | 403 | `skip_not_allowed` | `PATCH` with `skip_sponsors` by a hidden person, or with the feature off |
 
-Others (no `reason`): 404 `unknown device`, 404 `unknown install`, 503 `<TV> not connected (is YouTube open on it?)`, 409 `no video playing`, 409 `<TV> didn't turn captions on/off…`, 400 for a bad speed, mode or pairing code.
+Others (no `reason`): 404 `unknown device`, 404 `unknown install`, 503 `<TV> not connected (is YouTube open on it?)`, 503 `<TV> isn't answering…` (a speed or caption command didn't reach the TV: YouTube had dropped the session, refused the command, or couldn't be reached; the server starts a fresh session, so trying again in a few seconds usually works), 409 `no video playing`, 409 `<TV> didn't turn captions on/off…`, 400 for a bad speed, mode or pairing code.
 
 ## Video titles
 
