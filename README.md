@@ -12,7 +12,7 @@ There is no web UI any more. `/docs` and `/openapi.json` are FastAPI's.
 
 ## API
 
-- `GET /devices` — your TVs: `[{"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "skip_sponsors"?}]`. `title` and `channel` (string or `null`) describe `video_id`: see [Video titles](#video-titles). `skip_sponsors` (bool) is there only when you may use [skip sponsors](#skip-sponsors); the app shows the toggle only then. The same TV object comes back from `/pair`, `PATCH`, `/speed` and `/captions`.
+- `GET /devices` — your TVs: `[{"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "playing", "skip_sponsors"?}]`. `playing` is `true` while the TV reports Playing or Starting, `false` once it reports Paused, Stopped or ended, and `null` until it has said. `title` and `channel` (string or `null`) describe `video_id`: see [Video titles](#video-titles). `skip_sponsors` (bool) is there only when you may use [skip sponsors](#skip-sponsors); the app shows the toggle only then. The same TV object comes back from `/pair`, `PATCH`, `/speed`, `/captions` and `/playback`.
 - `POST /pair {"code": "..."}` — add a TV (YouTube → Settings → Link with TV code); returns that TV. 400 `pairing failed`; 409 `too_many_devices` past 10. Re-pairing a TV you already have replaces it.
 - `PATCH /devices/{id} {"name": "...", "skip_sponsors": true|false}` — either field or both (neither: 422); returns that TV. Nothing changes if any part is refused.
   - `name`: rename the TV. Trimmed, 1–40 characters (400 otherwise); `null` or `""` goes back to the name the TV reports. The custom name is yours only, survives reconnects and re-pairing, and is what `GET /devices` and Live Activities show.
@@ -20,6 +20,7 @@ There is no web UI any more. `/docs` and `/openapi.json` are FastAPI's.
 - `DELETE /devices/{id}` — forget a TV: `{"removed": id}`. Live Activities showing it are ended.
 - `POST /devices/{id}/speed/{x}` — x in 1, 1.25, 1.5, 1.75, 2. With your `auto_captions` setting on (the default), also captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`). With it off, only the speed changes: no caption command, and the caption choice re-applied to new videos stays as it was.
 - `POST /devices/{id}/captions/{on|off}` — manual caption toggle, whatever `auto_captions` is; 409 if the TV does not confirm the change. Whichever of slider (while `auto_captions` is on) and toggle was used last wins and is re-applied to each new video
+- `POST /devices/{id}/playback/{play|pause}` — play or pause; 409 `no video playing` without a video. Waits up to 1.5 s for the TV to report the change; if it doesn't, the answer says what was asked for and the TV's next report corrects it.
 - `GET /me/settings` — your settings: `{"auto_captions": true}` (the default).
 - `PATCH /me/settings {"auto_captions": true|false}` — change them; returns the full settings object. A strict boolean; `{}`, `null` or another type is 422. Stored per person in `settings.json` in `/data` (only values that differ from the defaults; written atomically). The setting is the caller's: on a TV two people paired, each person's speed requests follow their own.
 
@@ -67,12 +68,12 @@ Canopy Control (`com.canopysf.CanopyControl`) shows at most one Live Activity, f
 Pushes:
 
 - **A TV starts playing** — it reports Playing for a different video than the last one it played, or the first Playing after its session (re)connects (this includes a server restart), or after 30 min without Playing. Each of the owner's installs with an environment then gets an `update` if its activity already shows that TV and is under 8 h old (Apple's limit), otherwise a push-to-start (`SpeedAttributes`, alert "<TV name> / Now playing", relevance 100). The app adopts the new activity, ends any older one, and reports the new token with PUT. At most one start per install and TV every 2 minutes.
-- **State changes** — speed, captions, connected and name changes on a TV are pushed as an `update` to every activity showing it, debounced 0.5 s, and only when the content-state differs from the last one sent to that activity.
+- **State changes** — speed, captions, playing/paused, connected and name changes on a TV are pushed as an `update` to every activity showing it, debounced 0.5 s, and only when the content-state differs from the last one sent to that activity.
 - **TV removed** — activities showing it get an `end` (dismissed now) and are forgotten.
 - **A TV stops playing** — its video ended (YouTube's state 0, which pyytlounge calls `Buffering`), it reports `Stopped` or a `nowPlaying` with no video, YouTube on it closed (`loungeScreenDisconnected`), or its Lounge session ended. If it doesn't play again within `LIVE_ACTIVITY_END_GRACE_S` (60 s), the activities showing it get the same `end` as for a removed TV (final content-state, dismissed now) and are forgotten; the TV's next Playing then push-starts a fresh one (not held back by the 2-minute start limit). Playing or Starting within the grace, of the same video or a new one, cancels the end and things carry on as usual. Paused is not stopping, and a TV that comes back Paused after its session dropped keeps its activity too (an ended or stopped video has to play again). Our own forced resubscribe (an unconfirmed command) doesn't count; a routine session cycle does, and is cancelled by the next session's Playing. One pending end per TV and person; a second stop keeps the first deadline. Nothing is scheduled when no activity shows the TV. Each decision is logged at INFO (`stopped playing …`, `… within the grace period: keeping …`, `didn't play again … ended N`).
 - The relay's `unregistered` clears the token that was used. `failed` is logged and the token kept: `BadDeviceToken` usually means the install's `environment` is wrong.
 
-Content-state, matching the app's Swift type: `{"deviceId", "deviceName", "speed", "captions", "connected"}`. Installs persist in `installs.json` in `/data`.
+Content-state, matching the app's Swift type: `{"deviceId", "deviceName", "speed", "captions", "playing", "connected"}` (`playing` may be `null`; the app treats it as optional, so older servers still decode). Installs persist in `installs.json` in `/data`.
 
 Ops, once per server instance:
 

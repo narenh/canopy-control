@@ -109,7 +109,7 @@ def H(k): return {"Authorization": f"Bearer {TOK[k]}"}
 def saved(): return json.loads((DATA / "devices.json").read_text())
 
 
-INFO_KEYS = {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions"}
+INFO_KEYS = {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "playing"}
 
 
 def run_off():

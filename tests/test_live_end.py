@@ -145,6 +145,8 @@ def stored(): return json.loads((DATA / "installs.json").read_text())
 def take():
     out = relay_hits[:]; relay_hits.clear(); return out
 def events(b): return sorted((x["event"], x["device_token"]) for x in b)
+def nothing_but_updates():  # a playing/paused change is pushed as an update; no start or end
+    return [x for x in take() if x["event"] != "update"] == []
 def wait_for(cond, s=5):
     end = time.time() + s
     while time.time() < end:
@@ -186,7 +188,7 @@ with TestClient(main.app) as c:
     # ---------- the video ended (YouTube's state 0, pyytlounge's Buffering)
     Logs.records[:] = []
     T[0] += 10; state(LR, State.Buffering); drain()
-    check("ended: nothing sent at once", take() == [])
+    check("ended: nothing sent at once", nothing_but_updates())
     check("ended: scheduled, logged at INFO", len(logs("stopped playing (ended)")) == 1
           and logs("stopped playing")[0].levelno == logging.INFO, [r.getMessage() for r in Logs.records])
     check("ended: an end arrives after the grace", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3))
@@ -195,7 +197,7 @@ with TestClient(main.app) as c:
     e = b[0]
     check("end payload: dismissal_date now and the final content-state",
           e["dismissal_date"] == int(T[0]) and e["content_state"] == main.activity_state(LR)
-          and set(e["content_state"]) == {"deviceId", "deviceName", "speed", "captions", "connected"}
+          and set(e["content_state"]) == {"deviceId", "deviceName", "speed", "captions", "playing", "connected"}
           and e["environment"] == "sandbox" and e["priority"] == 10, e)
     check("ended: the activity is cleared, others kept", stored()[I1]["activity"] is None
           and stored()[I2]["activity"]["token"] == a2 and stored()[I3]["activity"]["token"] == a3, stored())
@@ -211,28 +213,29 @@ with TestClient(main.app) as c:
 
     # ---------- Stopped, and nowPlaying with no video
     T[0] += 5; state(LR, State.Stopped)
-    check("Stopped: ends after the grace", wait_for(lambda: relay_hits, 3)); drain(); b = take()
+    check("Stopped: ends after the grace", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain()
+    b = [x for x in take() if x["event"] != "update"]  # the update showing it paused comes first
     check("Stopped: the end", [(x["event"], x["device_token"]) for x in b] == [("end", a1)] and stored()[I1]["activity"] is None, b)
     nowp(LR, "v2", State.Playing); drain(); take(); a1 = show(I1, "scr-LR")
     Logs.records[:] = []
     nowp(LR, None, None)  # what pyytlounge makes of a nowPlaying with nothing in it
     check("nowPlaying with no video: scheduled", len(logs("stopped playing (no video)")) == 1, [r.getMessage() for r in Logs.records])
-    check("nowPlaying with no video: ends", wait_for(lambda: relay_hits, 3)); drain()
+    check("nowPlaying with no video: ends", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain()
     check("no video: the end", [(x["event"], x["device_token"]) for x in take()] == [("end", a1)])
     nowp(LR, "v3", State.Playing); drain(); take(); a1 = show(I1, "scr-LR")
     Logs.records[:] = []
     nowp(LR, None, State.Paused)  # no video, whatever the state
     check("no video while 'Paused' still counts", len(logs("stopped playing (no video)")) == 1)
-    check("no video while 'Paused': ends", wait_for(lambda: relay_hits, 3)); drain(); take()
+    check("no video while 'Paused': ends", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain(); take()
     nowp(LR, "v3", State.Playing); drain(); take(); a1 = show(I1, "scr-LR")
 
     # ---------- Paused is not stopping
     Logs.records[:] = []
     state(LR, State.Paused); past_grace()
-    check("Paused: nothing scheduled, nothing ended", take() == [] and logs("stopped playing") == []
+    check("Paused: nothing scheduled, nothing ended", nothing_but_updates() and logs("stopped playing") == []
           and stored()[I1]["activity"]["token"] == a1)
     nowp(LR, "v3", State.Paused); past_grace()
-    check("nowPlaying Paused on a video: nothing ended", take() == [] and stored()[I1]["activity"]["token"] == a1)
+    check("nowPlaying Paused on a video: nothing ended", nothing_but_updates() and stored()[I1]["activity"]["token"] == a1)
 
     # ---------- playing again within the grace cancels
     for again, label in ((lambda: state(LR, State.Playing), "Playing"), (lambda: state(LR, State.Starting), "Starting"),
@@ -243,7 +246,7 @@ with TestClient(main.app) as c:
         m = logs("within the grace period")
         check(f"{label}: cancel logged at INFO", len(m) == 1 and m[0].levelno == logging.INFO, [r.getMessage() for r in Logs.records])
     state(LR, State.Stopped); time.sleep(GRACE / 3); T[0] += 1; nowp(LR, "v4", State.Playing); past_grace(); b = take()
-    check("a new video within the grace: no end, the normal update", [(x["event"], x["device_token"]) for x in b] == [("update", a1)], b)
+    check("a new video within the grace: no end, only updates", b and {(x["event"], x["device_token"]) for x in b} == {("update", a1)}, b)
     state(LR, State.Buffering); time.sleep(GRACE / 3); nowp(LR, "v5", State.Starting); past_grace()
     check("a new video Starting within the grace: no end", ends() == [] and stored()[I1]["activity"]["token"] == a1)
 
@@ -252,14 +255,14 @@ with TestClient(main.app) as c:
     state(LR, State.Buffering); time.sleep(GRACE / 2); state(LR, State.Paused); state(LR, State.Stopped)
     nowp(LR, None, None)
     t0 = time.time()
-    check("ended then Paused: still ends", wait_for(lambda: relay_hits, 3)); drain(); b = take()
+    check("ended then Paused: still ends", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain(); b = [x for x in take() if x["event"] != "update"]
     check("one pending end per TV: one end, at the first deadline", [(x["event"], x["device_token"]) for x in b] == [("end", a1)]
           and time.time() - t0 < GRACE * 0.9 and len(logs("stopped playing")) == 1, (b, time.time() - t0))
     nowp(LR, "v6", State.Playing); drain(); take(); a1 = show(I1, "scr-LR")
 
     # ---------- per person: B's pairing of the same TV is its own
     state(BLR, State.Buffering)
-    check("B's TV stopping ends B's activity only", wait_for(lambda: relay_hits, 3)); drain(); b = take()
+    check("B's TV stopping ends B's activity only", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain(); b = [x for x in take() if x["event"] != "update"]
     check("  (just I3's)", [(x["event"], x["device_token"]) for x in b] == [("end", a3)]
           and stored()[I1]["activity"]["token"] == a1, b)
 
@@ -271,7 +274,7 @@ with TestClient(main.app) as c:
 
     # ---------- removing a TV with an end pending: one end (the removal's)
     state(BED, State.Buffering); time.sleep(GRACE / 3)
-    r = c.delete("/devices/scr-BED", headers=H("A")); past_grace(); b = take()
+    r = c.delete("/devices/scr-BED", headers=H("A")); past_grace(); b = [x for x in take() if x["event"] != "update"]
     check("removal during the grace: a single end", r.status_code == 200
           and [(x["event"], x["device_token"]) for x in b] == [("end", a2)], b)
 
@@ -290,7 +293,7 @@ with TestClient(main.app) as c:
     check("disconnected: scheduled once (the session ending after it keeps the deadline)",
           len(logs("stopped playing (disconnected)")) == 1 and len(logs("stopped playing")) == 1,
           [r.getMessage() for r in logs("stopped playing")])
-    check("disconnected: ends after the grace", wait_for(lambda: relay_hits, 3)); drain(); b = take()
+    check("disconnected: ends after the grace", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain(); b = [x for x in take() if x["event"] != "update"]
     check("disconnected: the end carries connected false", [(x["event"], x["device_token"]) for x in b] == [("end", d1)]
           and b[0]["content_state"]["connected"] is False and stored()[I1]["activity"] is None, b)
     DEN.api.live, DEN.api.now = True, ("x1", State.Playing)

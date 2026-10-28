@@ -49,6 +49,8 @@ jobs:
         run: python -I tests/test_reconnect.py
       - name: test_shorts
         run: python -I tests/test_shorts.py
+      - name: test_playback
+        run: python -I tests/test_playback.py
 
   compose:
     runs-on: ubuntu-latest

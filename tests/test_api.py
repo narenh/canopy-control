@@ -152,7 +152,7 @@ with TestClient(main.app) as c:
     n = len(acct["hits"])
     r = c.get("/devices", headers=H("A"))
     check("A sees only the saved TV", r.status_code == 200 and [d["id"] for d in r.json()] == ["scr-saved"], r.text)
-    check("device shape unchanged", set(r.json()[0]) == {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions"})
+    check("device shape unchanged", set(r.json()[0]) == {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "playing"})
     h = acct["hits"][-1]
     check("account service called once", len(acct["hits"]) == n + 1)
     check("site key sent as bearer", h.get("Authorization") == f"Bearer {SITE_KEY}", h)

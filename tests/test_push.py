@@ -151,7 +151,7 @@ PTS1, PTS2, PTS3 = "a1" * 40, "b2" * 40, "c3" * 40
 ACT1, ACT1B, ACT2, ACT3, ACT4 = "d4" * 40, "e5" * 40, "f6" * 40, "07" * 40, "18" * 40
 A, B = PERSON_A["id"], PERSON_B["id"]
 BUNDLE = "com.canopysf.CanopyControl"
-STATE_KEYS = {"deviceId", "deviceName", "speed", "captions", "connected"}
+STATE_KEYS = {"deviceId", "deviceName", "speed", "captions", "playing", "connected"}
 
 
 def ev(**kw): return types.SimpleNamespace(**kw)
@@ -259,7 +259,7 @@ with TestClient(main.app) as c:
     hits = take()
     check("start goes to both of A's installs, not B's", sorted(h["body"]["device_token"] for h in hits) == [PTS1, PTS2], hits)
     check("relay gets the key as bearer", all(h["auth"] == f"Bearer {APNS_KEY}" for h in hits))
-    st = {"deviceId": "scr-LR", "deviceName": "TV LR", "speed": 1.0, "captions": False, "connected": True}
+    st = {"deviceId": "scr-LR", "deviceName": "TV LR", "speed": 1.0, "captions": False, "playing": True, "connected": True}
     h1 = next(h["body"] for h in hits if h["body"]["device_token"] == PTS1)
     check("start payload exact", h1 == {
         "device_token": PTS1, "environment": "sandbox", "bundle_id": BUNDLE, "event": "start", "content_state": st,
@@ -395,7 +395,7 @@ with TestClient(main.app) as c:
     check("PATCH needs sign-in", c.patch("/devices/scr-BED", json={"name": "x"}).status_code == 401)
     r = patch("scr-BED", {"name": "  Bedroom  "}); drain(); b = bodies()
     check("rename trims and returns the TV", r.status_code == 200 and r.json()["name"] == "Bedroom"
-          and set(r.json()) == {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions"}, r.text)
+          and set(r.json()) == {"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "playing"}, r.text)
     check("GET /devices shows the new name", next(x for x in c.get("/devices", headers=H("A")).json() if x["id"] == "scr-BED")["name"] == "Bedroom")
     check("devices.json keeps both names", saved_entry("scr-BED")["name"] == "TV BED" and saved_entry("scr-BED")["custom_name"] == "Bedroom")
     check("rename pushes to the activity showing that TV",

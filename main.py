@@ -6,7 +6,9 @@ their own Lounge session. Up to MAX_DEVICES TVs per person. There is no web UI.
 
 GET    /devices                   - the caller's TVs with connection/playback state: {"id", "name",
                                    "connected", "video_id", "title", "channel", "speed", "captions",
-                                   "skip_sponsors"?}, also what pair, PATCH, speed and captions return
+                                   "playing", "skip_sponsors"?}, also what pair, PATCH, speed, captions
+                                   and playback return. "playing": true (playing or starting), false
+                                   (paused, stopped, ended) or null (the TV hasn't said yet)
 POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
 PATCH  /devices/{id} {"name": ..., "skip_sponsors": bool} - either or both: rename a TV (trimmed,
                                    1-40 chars; null or "" = the TV's own name), skip sponsors on it
@@ -14,6 +16,7 @@ DELETE /devices/{id}              - forget a TV (ends Live Activities showing it
 POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; with the caller's auto_captions on,
                                    also captions on above 1, off at 1; off: only the speed
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
+POST   /devices/{id}/playback/{play|pause} - 409 with no video; waits briefly for the TV to confirm
 GET    /me/settings               - the caller's settings: {"auto_captions": bool} (default true)
 PATCH  /me/settings {"auto_captions": bool} - change them (strict bool; {} is 422); returns all of
                                    them. Stored per person in settings.json, only non-defaults.
@@ -120,6 +123,8 @@ class Device(EventListener):
         self._video_id: str | None = None
         self.speed = 1.0
         self.captions = False  # only ever set from the TV's onSubtitlesTrackChanged
+        self.playing: bool | None = None  # Playing/Starting vs Paused/Stopped/ended; None until the TV says
+        self._playing_changed = asyncio.Event()
         self.want_captions: bool | None = None  # last control wins: slider (on above 1x) or toggle
         self._captions_changed = asyncio.Event()
         self._speed_changed = asyncio.Event()
@@ -157,15 +162,25 @@ class Device(EventListener):
         log.info("%s now playing: video=%s state=%s", self.display_name, e.video_id, e.state.name)
         if e.video_id:
             self.video_id = e.video_id
+            # Only with a video: the TV also answers getNowPlaying with no video while it plays.
+            self._set_playing(e.state)
         self._note_state(e.state, video=bool(e.video_id))
         if e.state == State.Playing:
             await self._auto_caption()
 
     async def playback_state_changed(self, e):
         log.info("%s state: %s (video=%s)", self.display_name, e.state.name, self.video_id)
+        self._set_playing(e.state)
         self._note_state(e.state)
         if e.state == State.Playing:
             await self._auto_caption()
+
+    def _set_playing(self, state):
+        playing = state in (State.Playing, State.Starting)
+        self._playing_changed.set()
+        if playing != self.playing:
+            self.playing = playing
+            self._changed()
 
     async def playback_speed_changed(self, e):
         self.speed = e.playback_speed
@@ -328,6 +343,24 @@ class Device(EventListener):
             # (player remote.js) sends setSubtitlesTrack with only the videoId.
             await self._send("captions", self.api._command("setSubtitlesTrack", {"videoId": self.video_id}))
 
+    async def set_playing(self, play: bool):
+        """Play or pause; if that's a change, wait for the TV to say so. If it doesn't in time, the
+        answer says what was asked for (the TV's event corrects it)."""
+        self._playing_changed.clear()
+        await self._send("play" if play else "pause", self.api.play() if play else self.api.pause())
+        if self.playing != play:
+            try:
+                await asyncio.wait_for(self._wait_playing(play), CAPTION_WAIT)
+            except asyncio.TimeoutError:
+                log.info("%s: TV didn't report %s yet", self.display_name, "playing" if play else "paused")
+                self.playing = play
+                self._changed()
+
+    async def _wait_playing(self, play: bool):
+        while self.playing != play:
+            await self._playing_changed.wait()
+            self._playing_changed.clear()
+
     async def _auto_caption(self):
         """The TV keeps the speed across videos but not captions, so re-apply the last choice per video."""
         if self.want_captions is None or not self.video_id or self.video_id == self._auto_captioned:
@@ -472,7 +505,7 @@ class Device(EventListener):
         title, channel = titles.get(self.video_id)
         out = {"id": self.id, "name": self.display_name, "connected": self.api.connected(),
                "video_id": self.video_id, "title": title, "channel": channel,
-               "speed": self.speed, "captions": self.captions}
+               "speed": self.speed, "captions": self.captions, "playing": self.playing}
         if skip_allowed(self.owner):  # the app shows the toggle only when this is there
             out["skip_sponsors"] = self.skip_sponsors
         return out
@@ -485,6 +518,7 @@ def skip_allowed(owner: str) -> bool:
 def activity_state(d: Device) -> dict:
     """The Live Activity content-state for a TV: SpeedAttributes.ContentState in the app."""
     return {"deviceId": d.id, "deviceName": d.display_name, "speed": d.speed, "captions": d.captions,
+            "playing": d.playing,
             "connected": d.api.connected()}
 
 
@@ -820,6 +854,15 @@ async def set_captions(device_id: str, mode: str, person: dict = Depends(require
         hint = f" (does this video have '{CAPTION_LANG}' captions?)" if mode == "on" else ""
         # not 502: Cloudflare replaces 502 bodies with its own page, hiding the detail
         raise HTTPException(409, f"{d.display_name} didn't turn captions {mode}{hint}")
+    return d.info()
+
+
+@app.post("/devices/{device_id}/playback/{action}")
+async def set_playback(device_id: str, action: str, person: dict = Depends(require_person)):
+    if action not in ("play", "pause"):
+        raise HTTPException(400, "action must be play or pause")
+    d = get(person["id"], device_id, need_video=True)
+    await d.set_playing(action == "play")
     return d.info()
 
 
