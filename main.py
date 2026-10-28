@@ -89,6 +89,7 @@ CANOPY_APNS_URL = (os.environ.get("CANOPY_APNS_URL") or "").strip() or live_push
 CANOPY_APNS_KEY = (os.environ.get("CANOPY_APNS_KEY") or "").strip()
 CANOPY_CONTROL_BUNDLE_ID = (os.environ.get("CANOPY_CONTROL_BUNDLE_ID") or "").strip() or live_push.DEFAULT_BUNDLE_ID
 RECONNECT_S = 10  # wait between failed Lounge connection attempts (a routine session end reconnects at once)
+SHORT_BACKOFF_S = 45  # after a Short ends our session, wait this long before reconnecting (see disconnected)
 EVENT_SILENCE_S = 60  # the TV sends something at least every 30 s: this long with nothing, the session is dead
 # Log every raw Lounge event from the TV (type and a truncated payload), for diagnosing what
 # the TV actually reports. On by default while Live Activity starts are being debugged.
@@ -133,6 +134,7 @@ class Device(EventListener):
         self._end_task: asyncio.Task | None = None  # pending end of its activities (see _stopping)
         self._end_why = ""  # what that end is for
         self._short_task: asyncio.Task | None = None  # see _check_short
+        self._reconnect_at = 0.0  # time.monotonic() before which _loop doesn't reconnect (see disconnected)
 
     @property
     def video_id(self) -> str | None:
@@ -173,6 +175,11 @@ class Device(EventListener):
         self._changed()
 
     async def disconnected(self, e):
+        # A Short ends every Lounge session on the TV, and a remote reconnecting straight away stops the
+        # Short: the TV goes back to its cast queue (seen on the bedroom TV, 2026-10-28). Stay away a while.
+        if getattr(e, "reason", None) == "disconnectedByUserScreenInitiated":
+            self._reconnect_at = time.monotonic() + SHORT_BACKOFF_S
+            log.info("%s ended our session (a Short?): reconnecting in %ds", self.display_name, SHORT_BACKOFF_S)
         self._changed()  # pyytlounge drops the session right after this returns; the push is debounced
         self._stopping("disconnected")
 
@@ -414,6 +421,8 @@ class Device(EventListener):
     async def _loop(self):
         """Keep connected + subscribed. Reconnects when the TV app closes or the token expires."""
         while True:
+            if (wait := self._reconnect_at - time.monotonic()) > 0:  # also holds a _resubscribe() back
+                await asyncio.sleep(wait)
             up = False  # this iteration's session connected
             started = time.monotonic()
             try:

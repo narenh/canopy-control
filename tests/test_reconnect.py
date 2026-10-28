@@ -16,6 +16,7 @@ from pyytlounge import YtLoungeApi  # noqa: E402
 
 main.RECONNECT_S = 0.3
 main.EVENT_SILENCE_S = 0.4
+main.SHORT_BACKOFF_S = 0.6
 passed = 0
 
 
@@ -87,6 +88,23 @@ async def run():
     api = FakeLounge()
     await run_device(api, 1.0)
     check("a live session is kept", len(api.connects) == 1, api.connects)
+
+    # A Short ends the session (disconnectedByUserScreenInitiated): stay away SHORT_BACKOFF_S.
+    d = main.Device("owner-1", "TV")
+    api = d.api = FakeLounge(session_s=0.35)
+    plain_subscribe = api.subscribe
+
+    async def kicked_by_short():
+        await plain_subscribe()
+        if len(api.connects) == 1:
+            await d.disconnected(types.SimpleNamespace(reason="disconnectedByUserScreenInitiated"))
+
+    api.subscribe = kicked_by_short
+    d.task = asyncio.create_task(d._loop())
+    await asyncio.sleep(1.2)
+    d.task.cancel()
+    gap = api.connects[1] - api.connects[0] if len(api.connects) > 1 else None
+    check("after a Short, reconnects only after SHORT_BACKOFF_S", gap is not None and gap >= 0.35 + main.SHORT_BACKOFF_S - 0.05, api.connects)
 
     # lounge.LoungeApi: commands one at a time, and any events move last_event_at.
     order, inflight = [], [0]
