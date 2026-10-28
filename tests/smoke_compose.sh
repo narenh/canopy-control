@@ -78,6 +78,26 @@ wait_log isponsorblocktv "starting iSponsorBlockTV for 1 device(s)" 15 || fail "
 sleep 15
 dc logs --no-color isponsorblocktv 2>&1 | grep -qE "exited with code|Traceback|Read-only|Permission denied" && fail "iSponsorBlockTV failed"
 ok "a device: iSponsorBlockTV started and is still running after 15 s"
+wait_log isponsorblocktv "[patch] Shorts aren't replayed as regular videos" 2 || fail "the Shorts patch wasn't applied"
+# The patch against this image: a Short's disconnect, then its captions event, replays nothing.
+# (Unpatched, upstream sends setPlaylist for the Short: checked too, so this test can't pass vacuously.)
+BOOT=$(dc config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["isponsorblocktv"]["command"][3])')
+replays=$(dc exec -T isponsorblocktv python3 -c "$BOOT
+import asyncio, logging
+async def replays():
+    api, sent = Api(logger=logging.getLogger('check')), []
+    async def record(vid): sent.append(vid)
+    api.play_video = record
+    await api._process_event('loungeScreenDisconnected', [{'reason': 'disconnectedByUserScreenInitiated'}])
+    await api._process_event('onSubtitlesTrackChanged', [{'videoId': '1FLHigSK3TQ'}])
+    await asyncio.sleep(0.1)
+    return len(sent)
+patched = asyncio.run(replays())
+Api._process_event = original
+print(patched, asyncio.run(replays()))
+" --patch-only | tail -1)
+[ "$replays" = "0 1" ] || fail "Shorts patch: replays (patched, unpatched) = '$replays', want '0 1'"
+ok "the Shorts patch applies to this image: a Short isn't replayed (upstream alone replays it)"
 
 # --- a change restarts it
 [ "$(render 'Smoke TV 2')" = True ] || fail "api couldn't rewrite the config"

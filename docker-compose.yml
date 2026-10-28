@@ -123,7 +123,32 @@ services:
             time.sleep(POLL_S)
         stop_child()
         log("stopped")
-    command: ["python3", "-u", "main.pyc"]
+    # The image's main.pyc, run by a few lines that first turn off iSponsorBlockTV's Shorts replay:
+    # when a Short ends its Lounge session, upstream replays the Short as a regular video once it
+    # reconnects (setPlaylist), which resets the YouTube app's navigation (search, channel pages).
+    # We don't need sponsors skipped in Shorts. If an upstream version has no such replay (the
+    # flag is gone from _process_event), it logs that and runs unpatched; the CI smoke test checks
+    # the patch against the pinned image. No $ in it (compose would interpolate it).
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import runpy, sys
+        from iSponsorBlockTV import ytlounge
+        Api = ytlounge.YtLoungeApi
+        original = Api._process_event
+        if "shorts_disconnected" in original.__code__.co_names:
+            async def process_event(self, event_type, args):
+                await original(self, event_type, args)
+                self.shorts_disconnected = False
+            Api._process_event = process_event
+            print("[patch] Shorts aren't replayed as regular videos", flush=True)
+        else:
+            print("[patch] no Shorts replay found in this iSponsorBlockTV: running it unpatched", flush=True)
+        if sys.argv[1:] != ["--patch-only"]:
+            sys.argv = ["main.pyc"]
+            runpy.run_path("main.pyc", run_name="__main__")
     stop_grace_period: 20s
     # api first: it creates the shared volume (owned by 10001, from its image) and the config
     depends_on: [api]
