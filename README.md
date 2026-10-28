@@ -35,6 +35,12 @@ Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 
 Others (no `reason`): 404 `unknown device`, 404 `unknown install`, 503 `<TV> not connected (is YouTube open on it?)`, 503 `<TV> isn't answering…` (a speed or caption command didn't reach the TV: YouTube had dropped the session, refused the command, or couldn't be reached; the server starts a fresh session, so trying again in a few seconds usually works), 409 `no video playing`, 409 `<TV> didn't turn captions on/off…`, 400 for a bad speed, mode or pairing code.
 
+## Shorts
+
+When a TV's video turns out to be a Short, the server sets that TV to 1x with captions off, and turns its auto-captions choice off too. Nothing is restored afterwards: the next video stays at 1x without captions until someone changes it. `shorts.py` asks `HEAD https://www.youtube.com/shorts/<id>` without following redirects: 200 is a Short, a redirect (303, to `/watch`) isn't. That's YouTube's behavior, not a documented API, so any other answer (404, a timeout) means "can't tell" and nothing is changed. Answers are cached per id (the 500 most recent); "can't tell" isn't.
+
+On the TV, a Short ends the Lounge session (`loungeScreenDisconnected`, reason `disconnectedByUserScreenInitiated`); after the reconnect, a captions event names the Short, and that's when the check runs.
+
 ## Video titles
 
 `title` and `channel` come from YouTube's public oEmbed endpoint (`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=<id>&format=json`, fields `title` and `author_name`; no key). `oembed.py`:

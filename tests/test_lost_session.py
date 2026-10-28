@@ -27,6 +27,7 @@ async def no_title(vid):
 
 
 main.titles.fetch = no_title
+main.shorts_check.fetch = lambda vid: asyncio.sleep(0, False)  # never youtube.com: no Shorts here
 passed = 0
 
 

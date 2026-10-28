@@ -127,6 +127,7 @@ async def fake_fetch(vid):
 
 
 main.titles.fetch = fake_fetch
+main.shorts_check.fetch = lambda vid: asyncio.sleep(0, False)  # never youtube.com: no Shorts here
 TT = [5000.0]
 main.titles.clock = lambda: TT[0]
 

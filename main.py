@@ -28,6 +28,10 @@ Titles (oembed.py): "title" and "channel" are the TV's current video's, from You
 endpoint, fetched in the background when the video changes and cached per video id; null until
 fetched, with no video, or when oEmbed has none (private/unembeddable; retried after 10 min).
 
+Shorts (shorts.py): when a TV's video turns out to be a Short (youtube.com/shorts/<id> answers 200,
+not a redirect), it's set to 1x with captions off, and want_captions goes off too. Nothing is
+restored after the Short: the next video plays at 1x without captions until someone changes it.
+
 Skip sponsors (an iSponsorBlockTV container next to this one, isbtv.py): on when ISPONSORBLOCKTV_CONFIG
 is set. Each TV in GET /devices etc. then has "skip_sponsors", except for SKIP_HIDDEN_PERSON_IDS (and
 for everyone when it's off), who get 403 skip_not_allowed for PATCH {"skip_sponsors": ...}. The TVs
@@ -67,6 +71,7 @@ from lounge import LoungeApi
 import isbtv
 import live_push
 import oembed
+import shorts
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
@@ -95,6 +100,7 @@ logging.basicConfig(level=logging.INFO)
 ISBTV = isbtv.from_env(os.environ)  # None: skip sponsors is off
 canopy = canopy_account.CanopyAccount(CANOPY_ACCOUNT_URL, CANOPY_ACCOUNT_KEY) if CANOPY_ACCOUNT_KEY else None
 titles = oembed.Titles()  # the current video's title and channel, fetched in the background
+shorts_check = shorts.Shorts()  # whether a video is a Short (see Device._reset_for_short)
 
 
 class Device(EventListener):
@@ -126,6 +132,7 @@ class Device(EventListener):
         self._stopped_at = 0.0  # when it last stopped being Playing (live.clock time)
         self._end_task: asyncio.Task | None = None  # pending end of its activities (see _stopping)
         self._end_why = ""  # what that end is for
+        self._short_task: asyncio.Task | None = None  # see _check_short
 
     @property
     def video_id(self) -> str | None:
@@ -137,6 +144,7 @@ class Device(EventListener):
             return
         titles.want(v)  # in the background: info() shows the title once it's known
         self._video_id = v
+        self._check_short(v)
         # Kept in devices.json: after a restart a TV may not say what it's playing until something
         # changes (it answers getNowPlaying with no video), so the app would show nothing playing.
         try:
@@ -330,6 +338,32 @@ class Device(EventListener):
             await self._send_captions(self.want_captions)
         except Exception as ex:
             log.warning("%s auto-captions failed: %s", self.display_name, ex)
+
+    def _check_short(self, video_id: str | None):
+        """In the background (needs a running loop; without one, nothing): see _reset_for_short."""
+        if not video_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._short_task = loop.create_task(self._reset_for_short(video_id))
+
+    async def _reset_for_short(self, video_id: str):
+        """A Short plays at 1x with captions off. Nothing is restored after it: the next video
+        stays at 1x, and auto-captions (want_captions) stays off, as if the slider had gone to 1x."""
+        try:
+            if await shorts_check.is_short(video_id) is not True or self.video_id != video_id:
+                return
+            log.info("%s is playing a Short (%s): 1x, captions off", self.display_name, video_id)
+            self.want_captions = False
+            self._auto_captioned = video_id  # _auto_caption leaves this video alone
+            await self.set_speed(1.0)  # sent even if we think it's 1x: our speed may be stale
+            await self.set_captions(False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            log.warning("%s: couldn't reset for a Short: %s", self.display_name, getattr(ex, "detail", ex))
 
     async def set_captions(self, on: bool):
         """Ask the TV for captions; if that's a change, wait for the TV to confirm it."""
@@ -622,6 +656,7 @@ async def lifespan(_):
         await d.stop()
     await live.close()
     await titles.close()
+    await shorts_check.close()
     await canopy.close()
 
 
