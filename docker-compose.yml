@@ -26,6 +26,7 @@ services:
       CANOPY_ACCOUNT_KEY: ${CANOPY_ACCOUNT_KEY:?set CANOPY_ACCOUNT_KEY}  # the server refuses to start without it
       CANOPY_APNS_URL: ${CANOPY_APNS_URL:-https://apns.canopysf.com}
       CANOPY_APNS_KEY: ${CANOPY_APNS_KEY:-}  # optional; without it there are no Live Activity pushes
+      AUTOPLAY_GUARD: ${AUTOPLAY_GUARD:-1}  # pause videos the TV autoplays; 0 turns it off
       # Skip sponsors: on because this is set. The rest are iSponsorBlockTV's settings (isbtv.py).
       ISPONSORBLOCKTV_CONFIG: /isbtv/config.json
       SKIP_HIDDEN_PERSON_IDS: ${SKIP_HIDDEN_PERSON_IDS:-}  # comma-separated Canopy person ids (App Review)

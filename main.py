@@ -35,6 +35,12 @@ Shorts (shorts.py): when a TV's video turns out to be a Short (youtube.com/short
 not a redirect), it's set to 1x with captions off, and want_captions goes off too. Nothing is
 restored after the Short: the next video plays at 1x without captions until someone changes it.
 
+Autoplay guard: YouTube on Apple TV plays the next video when one ends even with autoplay off (it
+reports ended, then a new video, with no command from anyone). When a TV reports a different video
+within AUTOPLAY_WINDOW_S of the last one ending (and none of our commands since), it's paused once,
+when the TV first reports it Playing (within AUTOPLAY_PAUSE_WINDOW_S of the switch; a pause sent
+while it's still loading can be dropped). AUTOPLAY_GUARD=0 turns this off.
+
 Skip sponsors (an iSponsorBlockTV container next to this one, isbtv.py): on when ISPONSORBLOCKTV_CONFIG
 is set. Each TV in GET /devices etc. then has "skip_sponsors", except for SKIP_HIDDEN_PERSON_IDS (and
 for everyone when it's off), who get 403 skip_not_allowed for PATCH {"skip_sponsors": ...}. The TVs
@@ -56,8 +62,8 @@ Env: CANOPY_ACCOUNT_KEY (required; the site key from the Account Manager's Sites
 CANOPY_ACCOUNT_URL (default https://account.canopysf.com), DATA_DIR (default /data),
 CAPTION_LANG (default en), CANOPY_APNS_KEY (this instance's relay key; unset = no pushes),
 CANOPY_APNS_URL (default https://apns.canopysf.com), CANOPY_CONTROL_BUNDLE_ID (default
-com.canopysf.CanopyControl); for skip sponsors, ISPONSORBLOCKTV_CONFIG, SKIP_HIDDEN_PERSON_IDS and the
-iSponsorBlockTV settings in isbtv.py.
+com.canopysf.CanopyControl), AUTOPLAY_GUARD (default on; 0/false/no/off: off); for skip
+sponsors, ISPONSORBLOCKTV_CONFIG, SKIP_HIDDEN_PERSON_IDS and the iSponsorBlockTV settings in isbtv.py.
 """
 import asyncio, json, logging, os, tempfile, time
 from contextlib import asynccontextmanager
@@ -96,6 +102,10 @@ EVENT_SILENCE_S = 60  # the TV sends something at least every 30 s: this long wi
 # Log every raw Lounge event from the TV (type and a truncated payload), for diagnosing what
 # the TV actually reports. On by default while Live Activity starts are being debugged.
 LOG_LOUNGE_EVENTS = (os.environ.get("LOG_LOUNGE_EVENTS") or "1").strip().lower() not in ("0", "false", "no", "off")
+# Pause a video the TV autoplayed after the last one ended (see Device._autoplay_check).
+AUTOPLAY_GUARD = (os.environ.get("AUTOPLAY_GUARD") or "1").strip().lower() not in ("0", "false", "no", "off")
+AUTOPLAY_WINDOW_S = 5  # a different video this soon after one ended is an autoplay
+AUTOPLAY_PAUSE_WINDOW_S = 15  # it's paused when it first plays within this long of the switch
 PLAY_IDLE_S = 30 * 60  # Playing again after this long without counts as starting to play
 LIVE_ACTIVITY_END_GRACE_S = 60  # a TV that stopped playing has this long to play again before its activities end
 log = logging.getLogger("yt-speed")
@@ -138,6 +148,13 @@ class Device(EventListener):
         self._end_task: asyncio.Task | None = None  # pending end of its activities (see _stopping)
         self._end_why = ""  # what that end is for
         self._short_task: asyncio.Task | None = None  # see _check_short
+        # autoplay guard (see _autoplay_check)
+        self._ended_at = float("-inf")  # when the TV last reported a video ended (time.monotonic)
+        self._ended_video: str | None = None  # which video that was
+        self._commanded_at = float("-inf")  # when we last sent the TV a command
+        self._autoplayed: str | None = None  # a video it autoplayed, not paused yet
+        self._autoplayed_at = 0.0  # when it switched to it
+        self._autoplay_task: asyncio.Task | None = None  # the pause
 
     @property
     def video_id(self) -> str | None:
@@ -148,6 +165,7 @@ class Device(EventListener):
         if v == self._video_id:
             return
         titles.want(v)  # in the background: info() shows the title once it's known
+        self._autoplay_check(v)
         self._video_id = v
         self._check_short(v)
         # Kept in devices.json: after a restart a TV may not say what it's playing until something
@@ -165,14 +183,19 @@ class Device(EventListener):
             # Only with a video: the TV also answers getNowPlaying with no video while it plays.
             self._set_playing(e.state)
         self._note_state(e.state, video=bool(e.video_id))
+        if e.state == State.Playing and e.video_id:
+            self._autoplay_playing()
         if e.state == State.Playing:
             await self._auto_caption()
 
     async def playback_state_changed(self, e):
         log.info("%s state: %s (video=%s)", self.display_name, e.state.name, self.video_id)
+        if e.state == State.Buffering and self.video_id:  # YouTube's state 0, "ended"
+            self._ended_at, self._ended_video = time.monotonic(), self.video_id
         self._set_playing(e.state)
         self._note_state(e.state)
         if e.state == State.Playing:
+            self._autoplay_playing()
             await self._auto_caption()
 
     def _set_playing(self, state):
@@ -190,6 +213,51 @@ class Device(EventListener):
     async def disconnected(self, e):
         self._changed()  # pyytlounge drops the session right after this returns; the push is debounced
         self._stopping("disconnected")
+
+    # --- autoplay guard (never raise, never block)
+    def _autoplay_check(self, video: str | None):
+        """The TV switched to `video`: an autoplay if a different video ended within
+        AUTOPLAY_WINDOW_S and we sent no command since. Not a new video with no recent end, nor the
+        same video starting again. An end counts once: any change of video uses it up."""
+        try:
+            ended_at, ended = self._ended_at, self._ended_video
+            self._ended_at, self._ended_video = float("-inf"), None
+            self._autoplayed = None
+            now = time.monotonic()
+            if (not AUTOPLAY_GUARD or not video or not ended or video == ended
+                    or now - ended_at > AUTOPLAY_WINDOW_S or self._commanded_at >= ended_at):
+                return
+            log.info("%s autoplayed %s after %s ended: pausing it", self.display_name, video, ended)
+            self._autoplayed, self._autoplayed_at = video, now
+        except Exception:
+            log.exception("%s: autoplay check failed", self.display_name)
+
+    def _autoplay_playing(self):
+        """The TV reports Playing: if it's a video it autoplayed, pause it (once, in the background).
+        Not on Starting: while it loads, the TV goes Starting, Stopped, Starting again, and a
+        pause sent then can be dropped."""
+        try:
+            video = self._autoplayed
+            if not video or video != self.video_id:
+                return
+            self._autoplayed = None
+            if time.monotonic() - self._autoplayed_at > AUTOPLAY_PAUSE_WINDOW_S:
+                log.info("%s: autoplayed %s didn't play within %gs: leaving it", self.display_name, video,
+                         AUTOPLAY_PAUSE_WINDOW_S)
+                return
+            self._autoplay_task = asyncio.get_running_loop().create_task(self._pause_autoplayed(video))
+        except Exception:
+            log.exception("%s: autoplay pause failed", self.display_name)
+
+    async def _pause_autoplayed(self, video: str):
+        try:
+            await self.set_playing(False)
+            log.info("%s paused autoplayed %s", self.display_name, video)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            log.warning("%s: couldn't pause autoplayed %s: %s", self.display_name, video,
+                        getattr(ex, "detail", None) or ex)
 
     # --- Live Activities (never raise, never block)
     def _note_state(self, state, video=True):
@@ -322,6 +390,7 @@ class Device(EventListener):
         """Await a Lounge command. If it didn't reach the TV (pyytlounge raised: no session,
         YouTube refused it, the network failed; or returned False: YouTube said the session is
         gone), start a fresh session and raise a 503 for the route to answer with (not a bare 500)."""
+        self._commanded_at = time.monotonic()  # a video change after this isn't an autoplay
         try:
             if await command is not False:
                 return
@@ -440,6 +509,8 @@ class Device(EventListener):
     async def stop(self):
         if self.task:
             self.task.cancel()
+        if self._autoplay_task:
+            self._autoplay_task.cancel()
         if self._end_task:
             self._end_task.cancel()  # removing the TV ends its activities itself (live.removed)
         await self.api.close()

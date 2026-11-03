@@ -42,6 +42,10 @@ When a TV's video turns out to be a Short, the server sets that TV to 1x with ca
 
 On the TV, a Short ends the Lounge session (`loungeScreenDisconnected`, reason `disconnectedByUserScreenInitiated`); after the reconnect, a captions event names the Short, and that's when the check runs.
 
+## Autoplay guard
+
+YouTube on Apple TV plays the next video when one ends even with autoplay off in its settings (and while it tells Lounge remotes `onAutoplayModeChanged DISABLED`): it reports the video ended (`onStateChange` state 0), then `playlistModified` and `nowPlaying` with a new video, with no command from anyone. When a TV reports a different video within 5 s (`AUTOPLAY_WINDOW_S`) of the last one ending, and the server sent it no command in between, the server pauses that video once, when the TV first reports it Playing, if that's within 15 s of the switch (not on Starting: while it loads the TV goes Starting, Stopped, Starting, and a pause sent then can be dropped). Logged as `<TV> autoplayed <new> after <old> ended: pausing it`, then the outcome. The same video starting again, or a new video with no recent end, is left alone. `AUTOPLAY_GUARD=0` turns it off.
+
 ## Video titles
 
 `title` and `channel` come from YouTube's public oEmbed endpoint (`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=<id>&format=json`, fields `title` and `author_name`; no key). `oembed.py`:
@@ -125,6 +129,7 @@ Environment:
 - `CANOPY_APNS_KEY` — optional; this instance's key on the canopy-apns relay. Unset: no Live Activity pushes
 - `CANOPY_APNS_URL` — default `https://apns.canopysf.com`
 - `CANOPY_CONTROL_BUNDLE_ID` — default `com.canopysf.CanopyControl`
+- `AUTOPLAY_GUARD` — default on; `0`, `false`, `no` or `off` turns off the [autoplay guard](#autoplay-guard)
 - `ISPONSORBLOCKTV_CONFIG` — path of iSponsorBlockTV's `config.json`; set means skip sponsors is on. The compose file sets it.
 - `SKIP_HIDDEN_PERSON_IDS` — comma-separated Canopy person ids who don't get skip sponsors (App Review)
 - iSponsorBlockTV's settings, written into its config: `SKIP_CATEGORIES` (default `sponsor,selfpromo,music_offtopic`) → `skip_categories`; `SKIP_ADS` (default `true`) → `skip_ads`; `MUTE_ADS` (`false`) → `mute_ads`; `AUTO_PLAY` (`false`) → `auto_play`; `SKIP_MINIMUM_LENGTH` (`1`, seconds) → `minimum_skip_length`. Fixed: `join_name` "Canopy Control" (`SKIP_JOIN_NAME` to change it), `skip_count_tracking` true (`SKIP_COUNT_TRACKING`), `apikey` "", `channel_whitelist` []. A value that can't be right (e.g. `SKIP_ADS=maybe`) stops the server at startup.
