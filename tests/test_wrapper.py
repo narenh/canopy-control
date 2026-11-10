@@ -4,7 +4,8 @@ python -I tests/test_wrapper.py [repo path, default: this repo]
 
 Runs the script exactly as the compose file has it, with a fake iSponsorBlockTV as the child and a
 temp data dir: idle without devices, start once config.json lists one, restart on a change
-(including an atomic replace), restart after a crash, and SIGTERM forwarded on stop.
+(including an atomic replace), restart after a crash, and SIGTERM forwarded on stop. Then a child that
+ignores SIGTERM (as upstream v2.11.0 does with a TV connected) is SIGKILLed after STOP_S (1 s by default).
 """
 import json, os, signal, subprocess, sys, tempfile, threading, time
 from pathlib import Path
@@ -107,5 +108,24 @@ code = p.wait(10)
 check("SIGTERM: forwarded to the child", wait_for("child got SIGTERM", n + 1, s=2))
 check("SIGTERM: wrapper exits 0, promptly", code == 0 and time.time() - t0 < 3, (code, time.time() - t0))
 check("SIGTERM: logs stopped", wait_for("[wrapper] stopped", n, s=2))
+
+# --- a child that ignores SIGTERM (upstream v2.11.0 does while a TV is connected): killed after STOP_S
+assert 'STOP_S = float(os.environ.get("WRAPPER_STOP_S") or 1)' in SCRIPT, "default grace should be 1 s"
+STUBBORN = CHILD.replace("signal.signal(signal.SIGTERM, bye)", "signal.signal(signal.SIGTERM, lambda *_: print('child ignoring SIGTERM', flush=True))")
+stubborn = child.parent / "stubborn_isbtv.py"
+stubborn.write_text(STUBBORN)
+lines.clear(); write(["tv1"])
+env2 = dict(env, WRAPPER_STOP_S="1")
+p = subprocess.Popen([sys.executable, "-c", SCRIPT, sys.executable, "-I", str(stubborn), str(CONF)], env=env2,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+threading.Thread(target=lambda: [lines.append(l) for l in p.stdout], daemon=True).start()
+check("stubborn: started", wait_for("child up devices=1"))
+n = len(lines); t0 = time.time(); write(["tv1", "tv2"])
+check("stubborn: killed after the grace", wait_for("didn't stop in 1 s: killing it", n, s=5), lines[n:])
+check("stubborn: started again at once", wait_for("child up devices=2", n, s=5) and time.time() - t0 < 3.5, time.time() - t0)
+check("stubborn: got SIGTERM first", any("child ignoring SIGTERM" in l for l in lines[n:]))
+t0 = time.time(); p.send_signal(signal.SIGTERM)
+code = p.wait(10)
+check("stubborn: stop kills it too, wrapper exits 0 within the grace", code == 0 and time.time() - t0 < 3, (code, time.time() - t0))
 
 print(f"{len(passed)} checks passed")

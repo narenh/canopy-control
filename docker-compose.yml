@@ -50,7 +50,8 @@ services:
     # The image's own ENTRYPOINT is ["python3", "-u", "main.pyc"] (WORKDIR /app, data in /app/data).
     # It runs here as `command`, a child of this wrapper: started once config.json lists a TV,
     # restarted when the file changes (mtime/size/inode polled every 3 s) or if it exits (backoff
-    # 5 s doubling to 5 min), and sent SIGTERM when the container stops. No $ in it (compose
+    # 5 s doubling to 5 min), and sent SIGTERM when the container stops, then SIGKILL after 1 s
+    # (v2.11.0 never exits on SIGTERM while a TV is connected, see README). No $ in it (compose
     # would interpolate it).
     entrypoint:
       - python3
@@ -59,7 +60,7 @@ services:
         import json, os, signal, subprocess, sys, time
         CONFIG = os.path.join(os.environ.get("iSPBTV_data_dir") or "data", "config.json")
         POLL_S = float(os.environ.get("WRAPPER_POLL_S") or 3)
-        STOP_S = 10
+        STOP_S = float(os.environ.get("WRAPPER_STOP_S") or 1)
         cmd = sys.argv[1:]
         child, stopping = None, False
 
@@ -90,7 +91,7 @@ services:
                 try:
                     child.wait(STOP_S)
                 except subprocess.TimeoutExpired:
-                    log(f"iSponsorBlockTV didn't stop in {STOP_S} s: killing it")
+                    log(f"iSponsorBlockTV didn't stop in {STOP_S:g} s: killing it")
                     child.kill()
                     child.wait()
             child = None
