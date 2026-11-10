@@ -13,11 +13,17 @@ There is no web UI any more. `/docs` and `/openapi.json` are FastAPI's.
 ## API
 
 - `GET /devices` — your TVs: `[{"id", "name", "connected", "video_id", "title", "channel", "speed", "captions", "playing", "skip_sponsors"?}]`. `playing` is `true` while the TV reports Playing or Starting, `false` once it reports Paused, Stopped or ended, and `null` until it has said. `title` and `channel` (string or `null`) describe `video_id`: see [Video titles](#video-titles). `skip_sponsors` (bool) is there only when you may use [skip sponsors](#skip-sponsors); the app shows the toggle only then. The same TV object comes back from `/pair`, `PATCH`, `/speed`, `/captions` and `/playback`.
-- `POST /pair {"code": "..."}` — add a TV (YouTube → Settings → Link with TV code); returns that TV. 400 `pairing failed`; 409 `too_many_devices` past 10. Re-pairing a TV you already have replaces it.
+- `POST /pair {"code": "..."}` — add a TV (YouTube → Settings → Link with TV code); returns that TV. 400 `pairing failed`; 409 `too_many_devices` past 10. Re-pairing a TV you already have replaces it. A TV you have as a [Sponsor Block only TV](#sponsor-block-only-tvs) is converted: it keeps its custom name, gets `skip_sponsors` on (if you may use it), and the Sponsor Block only entry goes away.
 - `PATCH /devices/{id} {"name": "...", "skip_sponsors": true|false}` — either field or both (neither: 422); returns that TV. Nothing changes if any part is refused.
   - `name`: rename the TV. Trimmed, 1–40 characters (400 otherwise); `null` or `""` goes back to the name the TV reports. The custom name is yours only, survives reconnects and re-pairing, and is what `GET /devices` and Live Activities show.
   - `skip_sponsors`: turn skipping sponsors on this TV on or off, for you (kept across re-pairing). A strict boolean (422 otherwise). 403 `skip_not_allowed` if you may not use it, or it's off on this server.
 - `DELETE /devices/{id}` — forget a TV: `{"removed": id}`. Live Activities showing it are ended.
+- `GET /skip-tvs` — your [Sponsor Block only TVs](#sponsor-block-only-tvs): `[{"id", "name"}]`.
+- `POST /skip-tvs {"code": "..."}` — add one by its Link with TV code; returns `{"id", "name"}`. 400 `pairing failed`; 409 `already_paired` if it is already one of your paired TVs (the body also has `id` and `device_id`, that TV's id); 409 `too_many_devices` past 10. Adding one you already have returns it unchanged.
+- `PATCH /skip-tvs/{id} {"name": "..."}` — rename (same rules as `PATCH /devices`: trimmed, 1–40 characters, `null` or `""` goes back to the TV's own name); returns `{"id", "name"}`. 404 `unknown device`.
+- `DELETE /skip-tvs/{id}` — forget one: `{"removed": id}`. 404 `unknown device`.
+
+All four `/skip-tvs` routes answer 403 `skip_not_allowed` to a hidden person, or when the feature is off.
 - `POST /devices/{id}/speed/{x}` — x in 1, 1.25, 1.5, 1.75, 2. With your `auto_captions` setting on (the default), also captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`). With it off, only the speed changes: no caption command, and the caption choice re-applied to new videos stays as it was.
 - `POST /devices/{id}/captions/{on|off}` — manual caption toggle, whatever `auto_captions` is; 409 if the TV does not confirm the change. Whichever of slider (while `auto_captions` is on) and toggle was used last wins and is re-applied to each new video
 - `POST /devices/{id}/playback/{play|pause}` — play or pause; 409 `no video playing` without a video. Waits up to 1.5 s for the TV to report the change; if it doesn't, the answer says what was asked for and the TV's next report corrects it.
@@ -31,8 +37,9 @@ Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 | 401 | `signed_out` | no token, a malformed one, or signed out |
 | 403 | `email_unverified` | the account's email isn't proven |
 | 503 | `account_unreachable` | the account service can't be reached and nothing recent is cached |
-| 409 | `too_many_devices` | pairing an 11th TV |
-| 403 | `skip_not_allowed` | `PATCH` with `skip_sponsors` by a hidden person, or with the feature off |
+| 409 | `too_many_devices` | pairing an 11th TV, or adding an 11th Sponsor Block only TV |
+| 409 | `already_paired` | `POST /skip-tvs` of a TV that is already one of your paired TVs (body adds `id`, `device_id`) |
+| 403 | `skip_not_allowed` | `PATCH` with `skip_sponsors`, or any `/skip-tvs` route, by a hidden person or with the feature off |
 
 Others (no `reason`): 404 `unknown device`, 404 `unknown install`, 503 `<TV> not connected (is YouTube open on it?)`, 503 `<TV> isn't answering…` (a speed or caption command didn't reach the TV: YouTube had dropped the session, refused the command, or couldn't be reached; the server starts a fresh session, so trying again in a few seconds usually works), 409 `no video playing`, 409 `<TV> didn't turn captions on/off…`, 400 for a bad speed, mode or pairing code.
 
@@ -90,10 +97,20 @@ Ops, once per server instance:
 On when `ISPONSORBLOCKTV_CONFIG` is set (the compose file sets it to `/isbtv/config.json`); off otherwise, e.g. when the plain Dockerfile is deployed on its own.
 
 - Each person's choice is stored per TV in `devices.json` (`"skip_sponsors": true`).
-- iSponsorBlockTV's `devices` are the TVs with it on for anyone not hidden, once each (`{"screen_id", "name", "offset": 0}`, named with the first such owner's name for it). The other keys come from the environment, in iSponsorBlockTV's own names (see `isbtv.py`).
+- iSponsorBlockTV's `devices` are the TVs with it on for anyone not hidden, plus every [Sponsor Block only TV](#sponsor-block-only-tvs), once each (`{"screen_id", "name", "offset": 0}`, named with the first such owner's name for it). The other keys come from the environment, in iSponsorBlockTV's own names (see `isbtv.py`).
 - `api` rewrites `config.json` when that content changes (pairing, removing, toggling, or a name change of a TV in it) and at startup, atomically (temp file in the same directory, then `os.replace`), and only when the content differs, since each rewrite restarts iSponsorBlockTV.
 - **Hidden people** (`SKIP_HIDDEN_PERSON_IDS`, comma-separated Canopy person ids; the App Review account goes here) never get the field, get 403 `skip_not_allowed`, and their TVs are left out of iSponsorBlockTV. The list is read at startup: adding someone drops their TVs at the next restart (their stored choice is kept).
 - The old, separate iSponsorBlockTV instance doesn't know about this one: a TV handled by both gets every skip twice. Remove it there before turning it on here.
+
+### Sponsor Block only TVs
+
+TVs enrolled in iSponsorBlockTV and nothing else: no `Device`, no Lounge session, never in `GET /devices` or Live Activities (so no speed or caption control). They are stored per person in `skip_tvs.json` in `/data` (`[{"owner", "screen_id", "name", "custom_name"?}]`, written atomically; a missing file is empty, an unreadable one is logged, set aside as `skip_tvs.json.corrupt` and treated as empty). Routes: see [API](#api); same gating as `skip_sponsors`, at most 10 per person.
+
+- Adding one needs only the TV's screen id and name, so it makes the one `POST /pairing/get_screen` request that pyytlounge's `pair()` makes (what upstream iSponsorBlockTV's own pairing does) and closes the HTTP session. It never calls `connect()`, so no remote or Lounge session is left on the TV.
+- The config's devices are the union of the TVs with `skip_sponsors` on and all Sponsor Block only TVs, minus hidden owners, deduplicated by screen id. Two people can hold the same TV: removing one entry keeps it in the config for the other. It is re-rendered at startup and after every add, remove and conversion.
+- **Every config change restarts iSponsorBlockTV for all TVs** (it reads its config only at startup), so the file is rewritten only when its content changes. Renames never touch it (it names TVs by `isbtv.label(screen_id)`, not by display name).
+- A TV can't be both: adding one that is already a paired TV is 409 `already_paired` (turn on `skip_sponsors` for it instead); pairing a Sponsor Block only TV via `POST /pair` converts it.
+- `scripts/import_skip_tvs.py <file.json> --owner <person id> --data <dir>` merges a one-time list of `{"name", "screen_id"}` into `skip_tvs.json` (idempotent; prints screen ids as their first 8 characters only). Run it with the api stopped (a running api keeps the list in memory and would overwrite the import), then start it.
 
 ### How the two containers fit together
 
@@ -142,7 +159,7 @@ Locally (nothing is published on the host; add a `ports: ["127.0.0.1:8000:8000"]
 CANOPY_ACCOUNT_KEY=cnp_... docker compose up -d --build
 ```
 
-Pairings persist in `devices.json` on the `api-data` volume (`/data`), each with its owner's Canopy person id, any custom name (`custom_name`, next to the TV's own `name`), `skip_sponsors` when on, and the last video the TV reported (`video_id`, so a restart doesn't show a playing TV as having nothing on until it reports again). Entries from before accounts (no owner), and an old single-TV `auth.json`, are dropped at startup with a warning: re-pair those TVs from the app.
+Sponsor Block only TVs persist in `skip_tvs.json` next to it. Pairings persist in `devices.json` on the `api-data` volume (`/data`), each with its owner's Canopy person id, any custom name (`custom_name`, next to the TV's own `name`), `skip_sponsors` when on, and the last video the TV reported (`video_id`, so a restart doesn't show a playing TV as having nothing on until it reports again). Entries from before accounts (no owner), and an old single-TV `auth.json`, are dropped at startup with a warning: re-pair those TVs from the app.
 
 ### Coolify: switching to the Docker Compose build pack
 

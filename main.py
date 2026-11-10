@@ -13,6 +13,10 @@ POST   /pair {"code": "..."}      - pair another TV via its "Link with TV code"
 PATCH  /devices/{id} {"name": ..., "skip_sponsors": bool} - either or both: rename a TV (trimmed,
                                    1-40 chars; null or "" = the TV's own name), skip sponsors on it
 DELETE /devices/{id}              - forget a TV (ends Live Activities showing it)
+GET    /skip-tvs                  - the caller's Sponsor Block only TVs: [{"id", "name"}]
+POST   /skip-tvs {"code": "..."}  - add one via its "Link with TV code": {"id", "name"}
+PATCH  /skip-tvs/{id} {"name": ...} - rename (same rules as PATCH /devices)
+DELETE /skip-tvs/{id}             - forget one: {"removed": id}
 POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; with the caller's auto_captions on,
                                    also captions on above 1, off at 1; off: only the speed
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
@@ -24,7 +28,9 @@ PUT    /installs/{uuid}           - an app install's Live Activity tokens (see b
 DELETE /installs/{uuid}           - forget an install (the app's sign-out)
 
 Errors are JSON {"detail": "<sentence>"}, plus "reason" for: 401 signed_out, 403 email_unverified,
-503 account_unreachable, 409 too_many_devices, 403 skip_not_allowed. A speed or caption command
+503 account_unreachable, 409 too_many_devices, 403 skip_not_allowed, 409 already_paired (POST
+/skip-tvs of a TV that is already one of the caller's paired TVs; the body also has "id" and
+"device_id", that TV's id). A speed or caption command
 that doesn't reach the TV is a 503 (and starts a fresh Lounge session), not a 500.
 
 Titles (oembed.py): "title" and "channel" are the TV's current video's, from YouTube's public oEmbed
@@ -45,6 +51,15 @@ Skip sponsors (an iSponsorBlockTV container next to this one, isbtv.py): on when
 is set. Each TV in GET /devices etc. then has "skip_sponsors", except for SKIP_HIDDEN_PERSON_IDS (and
 for everyone when it's off), who get 403 skip_not_allowed for PATCH {"skip_sponsors": ...}. The TVs
 with it on, for anyone not hidden, are rendered into iSponsorBlockTV's config.json.
+
+Sponsor Block only TVs (skip_tvs.json): TVs enrolled in iSponsorBlockTV and nothing else. No Device,
+no Lounge session, never in GET /devices or Live Activities. Same gating as skip_sponsors (403
+skip_not_allowed when it's off or the person is hidden), up to MAX_DEVICES per person (409
+too_many_devices). Adding one pairs only far enough to learn the TV's screen id and name (POST
+/pairing/get_screen; no remote session is opened) and closes that again. POST /pair of a TV the
+caller has as one of these converts it: the new Device keeps the custom name, skip_sponsors goes on
+(if allowed), and the entry is removed. The config is the union of the paired TVs with skip_sponsors
+on and all these entries, minus hidden owners; a rename never rewrites it.
 
 Live Activities (Canopy Control, through the canopy-apns relay; live_push.py): PUT /installs/{uuid}
 takes {"environment": "sandbox"|"production", "push_to_start_token": hex, "activity": {"token":
@@ -85,6 +100,7 @@ import shorts
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
 SETTINGS_FILE = DATA / "settings.json"
+SKIP_TVS_FILE = DATA / "skip_tvs.json"  # Sponsor Block only TVs: no Device, no Lounge session
 LEGACY_AUTH = DATA / "auth.json"  # single-TV file from earlier versions, no owner: ignored
 CAPTION_LANG = os.environ.get("CAPTION_LANG", "en")
 CAPTION_WAIT = 1.5  # seconds to wait for the TV to confirm a speed or caption change (it takes well under 1)
@@ -667,13 +683,57 @@ def load_settings():
             settings[pid] = kept
 
 
+skip_tvs: dict[tuple[str, str], dict] = {}  # (owner, screen_id) -> {"owner","screen_id","name","custom_name"?}
+
+
+def skip_tv_name(e: dict) -> str:
+    return e.get("custom_name") or e["name"]
+
+
+def skip_tv_info(e: dict) -> dict:
+    return {"id": e["screen_id"], "name": skip_tv_name(e)}
+
+
+def save_skip_tvs():
+    write_atomic(SKIP_TVS_FILE, json.dumps(list(skip_tvs.values()), indent=1))
+
+
+def load_skip_tvs():
+    """skip_tvs.json: a list of {"owner","screen_id","name","custom_name"?}. A missing file is
+    empty; a file that isn't a JSON list is set aside as skip_tvs.json.corrupt (so the next save
+    doesn't destroy it) and treated as empty; single bad entries are skipped. Never raises."""
+    skip_tvs.clear()
+    try:
+        raw = json.loads(SKIP_TVS_FILE.read_text()) if SKIP_TVS_FILE.exists() else []
+        if not isinstance(raw, list):
+            raise ValueError("not a list")
+    except Exception as ex:
+        log.warning("ignoring unreadable %s: %s", SKIP_TVS_FILE, ex)
+        try:
+            os.replace(SKIP_TVS_FILE, SKIP_TVS_FILE.with_name(SKIP_TVS_FILE.name + ".corrupt"))
+        except OSError:
+            pass
+        raw = []
+    for e in raw:
+        owner, sid = (e.get("owner"), e.get("screen_id")) if isinstance(e, dict) else (None, None)
+        if not (isinstance(owner, str) and owner and isinstance(sid, str) and sid):
+            log.warning("skipping unreadable entry in %s", SKIP_TVS_FILE)
+            continue
+        name, custom = e.get("name"), e.get("custom_name")
+        skip_tvs.setdefault((owner, sid), {
+            "owner": owner, "screen_id": sid, "name": name if isinstance(name, str) and name else "TV",
+            **({"custom_name": custom} if isinstance(custom, str) and custom else {})})
+
+
 def render_isbtv():
-    """iSponsorBlockTV's config.json from the TVs with skip sponsors on (rewritten only on a change,
-    since every rewrite restarts it). Never raises: a failure here mustn't fail a pairing."""
+    """iSponsorBlockTV's config.json from the TVs with skip sponsors on and the Sponsor Block only
+    TVs (rewritten only on a change, since every rewrite restarts it). Never raises: a failure here
+    mustn't fail a pairing."""
     if ISBTV is None:
         return
     try:
         tvs = [(d.id, isbtv.label(d.id)) for d in devices.values() if d.skip_sponsors and skip_allowed(d.owner)]
+        tvs += [(e["screen_id"], isbtv.label(e["screen_id"])) for e in skip_tvs.values() if skip_allowed(e["owner"])]
         if ISBTV.write(tvs):
             log.info("iSponsorBlockTV config: %d TV(s) skipping sponsors", len(ISBTV.devices(tvs)))
     except Exception:
@@ -748,6 +808,7 @@ async def lifespan(_):
     check_writable(DATA)
     live.load()
     load_settings()
+    load_skip_tvs()
     loaded, dropped = load_devices()
     for d in loaded:
         devices[(d.owner, d.id)] = d
@@ -771,14 +832,16 @@ app = FastAPI(lifespan=lifespan)
 class ApiError(HTTPException):
     """An HTTPException that also says why, as a machine-readable `reason`."""
 
-    def __init__(self, status: int, detail: str, reason: str, headers: dict | None = None):
+    def __init__(self, status: int, detail: str, reason: str, headers: dict | None = None,
+                 extra: dict | None = None):
         super().__init__(status, detail, headers)
         self.reason = reason
+        self.extra = extra or {}  # more fields for the JSON body
 
 
 @app.exception_handler(ApiError)
 async def api_error(_: Request, ex: ApiError):
-    return JSONResponse({"detail": ex.detail, "reason": ex.reason}, ex.status_code, headers=ex.headers)
+    return JSONResponse({"detail": ex.detail, "reason": ex.reason, **ex.extra}, ex.status_code, headers=ex.headers)
 
 
 async def require_person(request: Request) -> dict:
@@ -838,6 +901,7 @@ async def pair(body: Pair, person: dict = Depends(require_person)):
         await d.api.close()
         raise ApiError(409, f"You can pair up to {MAX_DEVICES} TVs. Remove one first.", "too_many_devices")
     old = devices.get(key)  # re-pairing the same TV replaces this person's entry
+    only = skip_tvs.get(key)  # or their Sponsor Block only entry for it, which this converts
     devices[key] = d
     if old:
         d.custom_name = old.custom_name  # but keeps their name for it
@@ -845,9 +909,117 @@ async def pair(body: Pair, person: dict = Depends(require_person)):
         await old.stop()
     else:
         d.skip_sponsors = skip_allowed(owner)  # on by default for a new TV; turning it off is deliberate
+    if only:
+        d.custom_name = d.custom_name or only.get("custom_name")
+        skip_tvs.pop(key)
+        try:
+            save_skip_tvs()
+        except Exception:
+            log.exception("couldn't save %s after converting a TV; it stays listed there", SKIP_TVS_FILE)
     d.task = asyncio.create_task(d._loop())
-    save_devices()
+    save_devices()  # also renders the config, with the entry gone and the Device in
     return d.info()
+
+
+def require_skip_allowed(person: dict):
+    if not skip_allowed(person["id"]):
+        raise ApiError(403, "Skipping sponsors isn't available for this account.", "skip_not_allowed")
+
+
+def skip_tv_mutation(change, render: bool):
+    """Apply `change()` to skip_tvs and save it; if saving fails, put it back. The config follows
+    (`render`) only when the set of TVs changed: a rename never rewrites it."""
+    before = {k: dict(v) for k, v in skip_tvs.items()}
+    try:
+        change()
+        save_skip_tvs()
+    except BaseException:
+        skip_tvs.clear()
+        skip_tvs.update(before)
+        raise
+    if render:
+        render_isbtv()
+
+
+@app.get("/skip-tvs")
+async def list_skip_tvs(person: dict = Depends(require_person)):
+    require_skip_allowed(person)
+    return [skip_tv_info(e) for e in skip_tvs.values() if e["owner"] == person["id"]]
+
+
+@app.post("/skip-tvs")
+async def add_skip_tv(body: Pair, person: dict = Depends(require_person)):
+    require_skip_allowed(person)
+    owner = person["id"]
+    # Only far enough to learn the screen id and name: pyytlounge's pair() is one POST to
+    # /pairing/get_screen. No connect(), so no remote or Lounge session is left behind.
+    api = LoungeApi("Speed Remote", None, owner)
+    await api.__aenter__()
+    screen_id = name = None
+    try:
+        ok = await api.pair(body.code.replace(" ", ""))
+        if ok:
+            screen_id, name = api.auth.screen_id, api.screen_name or "TV"
+    except Exception as ex:
+        log.warning("skip-only pairing failed: %s", ex)
+        ok = False
+    finally:
+        await api.close()
+    if not ok or not screen_id:
+        raise HTTPException(400, "pairing failed")
+    if (owner, screen_id) in devices:
+        raise ApiError(409, "That TV is already paired. Turn on skipping sponsors for it instead.",
+                       "already_paired", extra={"id": screen_id, "device_id": screen_id})
+    key = (owner, screen_id)
+    if key in skip_tvs:  # pairing it again just finds it, with the name they gave it
+        return skip_tv_info(skip_tvs[key])
+    # No await between this check and the insert, so concurrent adds can't overshoot.
+    if sum(e["owner"] == owner for e in skip_tvs.values()) >= MAX_DEVICES:
+        raise ApiError(409, f"You can add up to {MAX_DEVICES} Sponsor Block only TVs. Remove one first.",
+                       "too_many_devices")
+    skip_tv_mutation(lambda: skip_tvs.__setitem__(key, {"owner": owner, "screen_id": screen_id, "name": name}),
+                     render=True)
+    return skip_tv_info(skip_tvs[key])
+
+
+class SkipTvPatch(BaseModel):
+    """name: null or "" goes back to the TV's own name."""
+    name: str | None = None
+
+    @model_validator(mode="after")
+    def _some(self):
+        if not self.model_fields_set:
+            raise ValueError("send name")
+        return self
+
+
+@app.patch("/skip-tvs/{tv_id}")
+async def patch_skip_tv(tv_id: str, body: SkipTvPatch, person: dict = Depends(require_person)):
+    require_skip_allowed(person)
+    e = skip_tvs.get((person["id"], tv_id))
+    if not e:
+        raise HTTPException(404, "unknown device")
+    name = None if body.name in (None, "") else body.name.strip()
+    if name is not None and not 1 <= len(name) <= MAX_NAME:
+        raise HTTPException(400, f"name must be 1 to {MAX_NAME} characters (or empty to use the TV's own name)")
+
+    def rename():
+        if name is None:
+            e.pop("custom_name", None)
+        else:
+            e["custom_name"] = name
+    skip_tv_mutation(rename, render=False)  # the config uses isbtv.label(), not names
+    return skip_tv_info(skip_tvs[(person["id"], tv_id)])
+
+
+@app.delete("/skip-tvs/{tv_id}")
+async def remove_skip_tv(tv_id: str, person: dict = Depends(require_person)):
+    require_skip_allowed(person)
+    key = (person["id"], tv_id)
+    if key not in skip_tvs:
+        raise HTTPException(404, "unknown device")
+    skip_tv_mutation(lambda: skip_tvs.pop(key), render=True)
+    return {"removed": tv_id}
 
 
 class DevicePatch(BaseModel):
