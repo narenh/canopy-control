@@ -15,6 +15,9 @@ SKIP_MINIMUM_LENGTH -> minimum_skip_length (seconds, default 1), SKIP_JOIN_NAME 
 name shown on the TV, default "Canopy Control"), SKIP_COUNT_TRACKING -> skip_count_tracking
 (default true). apikey is "" and channel_whitelist is [] (a whitelist needs a YouTube API key).
 SKIP_HIDDEN_PERSON_IDS: comma-separated Canopy person ids who never see or get the feature.
+SKIP_TVS_LIMIT (default 5): how many Sponsor Block only TVs (skip_tvs.json) one person may have;
+SKIP_TVS_LIMITS: per-person overrides, "<person id>=<n>,<person id>=<n>" (blank: none). Both need
+whole numbers of 1 or more; anything else stops the server at startup. Not written into config.json.
 """
 import json, logging, os, tempfile
 from pathlib import Path
@@ -25,6 +28,7 @@ KNOWN_CATEGORIES = {"sponsor", "selfpromo", "intro", "outro", "music_offtopic", 
                     "exclusive_access", "preview", "filler", "hook"}
 DEFAULT_CATEGORIES = "sponsor,selfpromo,music_offtopic"
 DEFAULT_JOIN_NAME = "Canopy Control"
+DEFAULT_SKIP_TVS_LIMIT = 5
 TRUE, FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
 
 
@@ -59,6 +63,26 @@ def _number(env, key: str, default: float) -> int | float:
     return int(n) if n == int(n) else n
 
 
+def _limit(raw, what: str) -> int:
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        raise ValueError(f"{what} must be a whole number of 1 or more, not {str(raw).strip()!r}") from None
+    if n < 1:
+        raise ValueError(f"{what} must be a whole number of 1 or more, not {n}")
+    return n
+
+
+def _limits(raw: str | None) -> dict[str, int]:
+    out = {}
+    for item in _list(raw):
+        who, sep, n = item.partition("=")
+        if not sep or not who.strip():
+            raise ValueError(f"SKIP_TVS_LIMITS entries look like <person id>=<n>, not {item!r}")
+        out[who.strip()] = _limit(n, f"SKIP_TVS_LIMITS for {who.strip()}")
+    return out
+
+
 def label(screen_id: str) -> str:
     """The name iSponsorBlockTV gets for a TV: fixed per screen id (it only shows in its logs). Not
     the TV's display name, because every config change restarts iSponsorBlockTV for everyone."""
@@ -66,10 +90,16 @@ def label(screen_id: str) -> str:
 
 
 class Config:
-    def __init__(self, path: Path, hidden: set[str], settings: dict):
+    def __init__(self, path: Path, hidden: set[str], settings: dict,
+                 skip_tv_limit: int = DEFAULT_SKIP_TVS_LIMIT, skip_tv_limits: dict[str, int] | None = None):
         self.path = path
         self.hidden = hidden
         self.settings = settings  # everything but devices
+        self.skip_tv_limit = skip_tv_limit  # Sponsor Block only TVs per person...
+        self.skip_tv_limits = skip_tv_limits or {}  # ...unless overridden for a person id
+
+    def limit_for(self, owner: str) -> int:
+        return self.skip_tv_limits.get(owner, self.skip_tv_limit)
 
     @staticmethod
     def devices(tvs) -> list[dict]:
@@ -135,4 +165,7 @@ def from_env(env) -> Config | None:
         "channel_whitelist": [],
         "use_proxy": False,
     }
-    return Config(Path(path), set(_list(env.get("SKIP_HIDDEN_PERSON_IDS"))), settings)
+    limit = (env.get("SKIP_TVS_LIMIT") or "").strip()
+    return Config(Path(path), set(_list(env.get("SKIP_HIDDEN_PERSON_IDS"))), settings,
+                  _limit(limit, "SKIP_TVS_LIMIT") if limit else DEFAULT_SKIP_TVS_LIMIT,
+                  _limits(env.get("SKIP_TVS_LIMITS")))

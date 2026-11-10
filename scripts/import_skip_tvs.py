@@ -7,10 +7,14 @@ tvs.json is a list of {"name": "...", "screen_id": "..."}. They are merged into
 <data>/skip_tvs.json (the format main.py's load_skip_tvs reads) for that owner, written atomically.
 Idempotent: a TV the owner already has there is left as it is (so a custom name survives); one the
 owner already has as a paired TV in devices.json is skipped. Screen ids are printed as their first
-8 characters only. Restart the api afterwards, so it reads the file (it loads it at startup).
+8 characters only. It is an admin tool, so the per-person limit (SKIP_TVS_LIMIT / SKIP_TVS_LIMITS, read
+from the environment like the server) doesn't stop it, but it warns when the owner ends up over it. Restart the api afterwards, so it reads the file (it loads it at startup).
 """
 import argparse, json, os, sys, tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # -I leaves the script's directory off
+import isbtv  # noqa: E402  (its SKIP_TVS_LIMIT / SKIP_TVS_LIMITS parsing)
 
 
 def short(screen_id: str) -> str:
@@ -89,6 +93,16 @@ def main(argv=None) -> int:
         write_atomic(store, json.dumps(entries, indent=1))
     print(f"{added} added, {same} already there, {already_paired} already paired, {bad} skipped as invalid; "
           f"{sum(1 for e in entries if isinstance(e, dict) and e.get('owner') == owner)} for this owner in {store}")
+    total = sum(1 for e in entries if isinstance(e, dict) and e.get("owner") == owner)
+    try:
+        cfg = isbtv.from_env({"ISPONSORBLOCKTV_CONFIG": "-", **{k: os.environ[k] for k in ("SKIP_TVS_LIMIT", "SKIP_TVS_LIMITS")
+                                                                if k in os.environ}})
+    except ValueError as ex:
+        print(f"warning: can't check the limit: {ex}")
+    else:
+        if total > cfg.limit_for(owner):
+            print(f"warning: this owner now has {total} Sponsor Block only TVs, over their limit of "
+                  f"{cfg.limit_for(owner)}; they can't add more until some are removed")
     return 0
 
 

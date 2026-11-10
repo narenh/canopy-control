@@ -19,7 +19,7 @@ There is no web UI any more. `/docs` and `/openapi.json` are FastAPI's.
   - `skip_sponsors`: turn skipping sponsors on this TV on or off, for you (kept across re-pairing). A strict boolean (422 otherwise). 403 `skip_not_allowed` if you may not use it, or it's off on this server.
 - `DELETE /devices/{id}` — forget a TV: `{"removed": id}`. Live Activities showing it are ended.
 - `GET /skip-tvs` — your [Sponsor Block only TVs](#sponsor-block-only-tvs): `[{"id", "name"}]`.
-- `POST /skip-tvs {"code": "..."}` — add one by its Link with TV code; returns `{"id", "name"}`. 400 `pairing failed`; 409 `already_paired` if it is already one of your paired TVs (the body also has `id` and `device_id`, that TV's id); 409 `too_many_devices` past 10. Adding one you already have returns it unchanged.
+- `POST /skip-tvs {"code": "..."}` — add one by its Link with TV code; returns `{"id", "name"}`. 400 `pairing failed`; 409 `already_paired` if it is already one of your paired TVs (the body also has `id` and `device_id`, that TV's id); 409 `too_many_devices` past your limit (default 5; the sentence names it). Adding one you already have returns it unchanged.
 - `PATCH /skip-tvs/{id} {"name": "..."}` — rename (same rules as `PATCH /devices`: trimmed, 1–40 characters, `null` or `""` goes back to the TV's own name); returns `{"id", "name"}`. 404 `unknown device`.
 - `DELETE /skip-tvs/{id}` — forget one: `{"removed": id}`. 404 `unknown device`.
 
@@ -37,7 +37,7 @@ Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 | 401 | `signed_out` | no token, a malformed one, or signed out |
 | 403 | `email_unverified` | the account's email isn't proven |
 | 503 | `account_unreachable` | the account service can't be reached and nothing recent is cached |
-| 409 | `too_many_devices` | pairing an 11th TV, or adding an 11th Sponsor Block only TV |
+| 409 | `too_many_devices` | pairing an 11th TV, or adding a Sponsor Block only TV past your limit |
 | 409 | `already_paired` | `POST /skip-tvs` of a TV that is already one of your paired TVs (body adds `id`, `device_id`) |
 | 403 | `skip_not_allowed` | `PATCH` with `skip_sponsors`, or any `/skip-tvs` route, by a hidden person or with the feature off |
 
@@ -104,13 +104,13 @@ On when `ISPONSORBLOCKTV_CONFIG` is set (the compose file sets it to `/isbtv/con
 
 ### Sponsor Block only TVs
 
-TVs enrolled in iSponsorBlockTV and nothing else: no `Device`, no Lounge session, never in `GET /devices` or Live Activities (so no speed or caption control). They are stored per person in `skip_tvs.json` in `/data` (`[{"owner", "screen_id", "name", "custom_name"?}]`, written atomically; a missing file is empty, an unreadable one is logged, set aside as `skip_tvs.json.corrupt` and treated as empty). Routes: see [API](#api); same gating as `skip_sponsors`, at most 10 per person.
+TVs enrolled in iSponsorBlockTV and nothing else: no `Device`, no Lounge session, never in `GET /devices` or Live Activities (so no speed or caption control). They are stored per person in `skip_tvs.json` in `/data` (`[{"owner", "screen_id", "name", "custom_name"?}]`, written atomically; a missing file is empty, an unreadable one is logged, set aside as `skip_tvs.json.corrupt` and treated as empty). Routes: see [API](#api); same gating as `skip_sponsors`, at most `SKIP_TVS_LIMIT` (default 5) per person, or the number set for that person in `SKIP_TVS_LIMITS`.
 
 - Adding one needs only the TV's screen id and name, so it makes the one `POST /pairing/get_screen` request that pyytlounge's `pair()` makes (what upstream iSponsorBlockTV's own pairing does) and closes the HTTP session. It never calls `connect()`, so no remote or Lounge session is left on the TV.
 - The config's devices are the union of the TVs with `skip_sponsors` on and all Sponsor Block only TVs, minus hidden owners, deduplicated by screen id. Two people can hold the same TV: removing one entry keeps it in the config for the other. It is re-rendered at startup and after every add, remove and conversion.
 - **Every config change restarts iSponsorBlockTV for all TVs** (it reads its config only at startup), so the file is rewritten only when its content changes. Renames never touch it (it names TVs by `isbtv.label(screen_id)`, not by display name).
 - A TV can't be both: adding one that is already a paired TV is 409 `already_paired` (turn on `skip_sponsors` for it instead); pairing a Sponsor Block only TV via `POST /pair` converts it.
-- `scripts/import_skip_tvs.py <file.json> --owner <person id> --data <dir>` merges a one-time list of `{"name", "screen_id"}` into `skip_tvs.json` (idempotent; prints screen ids as their first 8 characters only). Run it with the api stopped (a running api keeps the list in memory and would overwrite the import), then start it.
+- `scripts/import_skip_tvs.py <file.json> --owner <person id> --data <dir>` merges a one-time list of `{"name", "screen_id"}` into `skip_tvs.json` (idempotent; prints screen ids as their first 8 characters only). It is an admin tool and ignores the limit, but warns when the owner ends up over `SKIP_TVS_LIMIT` (read from its environment; `SKIP_TVS_LIMITS` is read too). Run it with the api stopped (a running api keeps the list in memory and would overwrite the import), then start it.
 
 ### How the two containers fit together
 
@@ -149,6 +149,7 @@ Environment:
 - `AUTOPLAY_GUARD` — default on; `0`, `false`, `no` or `off` turns off the [autoplay guard](#autoplay-guard)
 - `ISPONSORBLOCKTV_CONFIG` — path of iSponsorBlockTV's `config.json`; set means skip sponsors is on. The compose file sets it.
 - `SKIP_HIDDEN_PERSON_IDS` — comma-separated Canopy person ids who don't get skip sponsors (App Review)
+- `SKIP_TVS_LIMIT` — Sponsor Block only TVs per person (default `5`); `SKIP_TVS_LIMITS` — per-person overrides, `<person id>=<n>,<person id>=<n>` (default empty). Whole numbers of 1 or more; anything else stops the server at startup. `docker-compose.yml` passes both through (`${SKIP_TVS_LIMIT:-5}`, `${SKIP_TVS_LIMITS:-}`).
 - iSponsorBlockTV's settings, written into its config: `SKIP_CATEGORIES` (default `sponsor,selfpromo,music_offtopic`) → `skip_categories`; `SKIP_ADS` (default `true`) → `skip_ads`; `MUTE_ADS` (`false`) → `mute_ads`; `AUTO_PLAY` (`false`) → `auto_play`; `SKIP_MINIMUM_LENGTH` (`1`, seconds) → `minimum_skip_length`. Fixed: `join_name` "Canopy Control" (`SKIP_JOIN_NAME` to change it), `skip_count_tracking` true (`SKIP_COUNT_TRACKING`), `apikey` "", `channel_whitelist` []. A value that can't be right (e.g. `SKIP_ADS=maybe`) stops the server at startup.
 
 The api image runs as uid 10001 and refuses to start if `/data` isn't writable by it (a volume made by the older, root image needs `chown -R 10001:10001`, or start from an empty one).

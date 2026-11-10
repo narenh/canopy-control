@@ -54,7 +54,8 @@ with it on, for anyone not hidden, are rendered into iSponsorBlockTV's config.js
 
 Sponsor Block only TVs (skip_tvs.json): TVs enrolled in iSponsorBlockTV and nothing else. No Device,
 no Lounge session, never in GET /devices or Live Activities. Same gating as skip_sponsors (403
-skip_not_allowed when it's off or the person is hidden), up to MAX_DEVICES per person (409
+skip_not_allowed when it's off or the person is hidden), up to SKIP_TVS_LIMIT (default 5, per person
+overridable with SKIP_TVS_LIMITS, see isbtv.py) per person (409
 too_many_devices). Adding one pairs only far enough to learn the TV's screen id and name (POST
 /pairing/get_screen; no remote session is opened) and closes that again. POST /pair of a TV the
 caller has as one of these converts it: the new Device keeps the custom name, skip_sponsors goes on
@@ -974,8 +975,9 @@ async def add_skip_tv(body: Pair, person: dict = Depends(require_person)):
     if key in skip_tvs:  # pairing it again just finds it, with the name they gave it
         return skip_tv_info(skip_tvs[key])
     # No await between this check and the insert, so concurrent adds can't overshoot.
-    if sum(e["owner"] == owner for e in skip_tvs.values()) >= MAX_DEVICES:
-        raise ApiError(409, f"You can add up to {MAX_DEVICES} Sponsor Block only TVs. Remove one first.",
+    limit = ISBTV.limit_for(owner)
+    if sum(e["owner"] == owner for e in skip_tvs.values()) >= limit:
+        raise ApiError(409, f"You can add up to {limit} Sponsor Block only TV{'s' if limit != 1 else ''}. Remove one first.",
                        "too_many_devices")
     skip_tv_mutation(lambda: skip_tvs.__setitem__(key, {"owner": owner, "screen_id": screen_id, "name": name}),
                      render=True)

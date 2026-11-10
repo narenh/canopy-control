@@ -15,11 +15,14 @@ REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent
 OFF = sys.argv[2:] == ["off"]
 sys.path.insert(0, REPO)
 
-TOK = {k: k * 43 for k in "ABH"}
+TOK = {k: k * 43 for k in "ABCH"}
 A, B, HID = ("aaaaaaaa-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002",
              "hhhhhhhh-0000-4000-8000-000000000003")
+CC = "cccccccc-0000-4000-8000-000000000004"
+ANSWER_IDS = {"A": A, "B": B, "C": CC}
 ANSWERS = {TOK["A"]: {"person": {"id": A, "emailVerified": True}},
            TOK["B"]: {"person": {"id": B, "emailVerified": True}},
+           TOK["C"]: {"person": {"id": CC, "emailVerified": True}},
            TOK["H"]: {"person": {"id": HID, "emailVerified": True}}}
 SITE_KEY = "cnp_test_key"
 
@@ -56,11 +59,13 @@ SKIPFILE = DATA / "skip_tvs.json"
     {"owner": A, "name": "TV LIV", "custom_name": "Living", "auth": {"version": 1, "screenId": "scr-LIV"}},
 ]))
 for k in ("SKIP_CATEGORIES", "SKIP_ADS", "MUTE_ADS", "AUTO_PLAY", "SKIP_MINIMUM_LENGTH", "SKIP_JOIN_NAME",
-          "SKIP_COUNT_TRACKING", "ISPONSORBLOCKTV_CONFIG", "SKIP_HIDDEN_PERSON_IDS", "CANOPY_APNS_KEY"):
+          "SKIP_COUNT_TRACKING", "ISPONSORBLOCKTV_CONFIG", "SKIP_HIDDEN_PERSON_IDS", "CANOPY_APNS_KEY",
+          "SKIP_TVS_LIMIT", "SKIP_TVS_LIMITS"):
     os.environ.pop(k, None)
 os.environ.update(DATA_DIR=str(DATA), CANOPY_ACCOUNT_URL=f"http://127.0.0.1:{PORT}", CANOPY_ACCOUNT_KEY=SITE_KEY)
 if not OFF:
-    os.environ.update(ISPONSORBLOCKTV_CONFIG=str(CONF), SKIP_HIDDEN_PERSON_IDS=HID)
+    os.environ.update(ISPONSORBLOCKTV_CONFIG=str(CONF), SKIP_HIDDEN_PERSON_IDS=HID,
+                      SKIP_TVS_LIMITS=f" {B}=7 , ,{CC}=2")
 
 import isbtv  # noqa: E402
 import main  # noqa: E402
@@ -244,16 +249,18 @@ with TestClient(main.app) as c:
     r = add("123")
     check("and now it is already_paired", r.status_code == 409 and r.json()["reason"] == "already_paired")
 
-    # --- limit
-    for i in range(10):
-        r = add(f"L{i}", "B")
-        check(f"B adds TV {i + 1}", r.status_code == 200, r.text)
-    r = add("L10", "B")
-    check("11th is 409 too_many_devices", r.status_code == 409 and r.json()["reason"] == "too_many_devices"
-          and "10" in r.json()["detail"], r.text)
-    check("re-adding one at the limit still works", add("L3", "B").status_code == 200)
-    check("the limit is per person", add("L10", "A").status_code == 200)
-    check("a refused add stored nothing", sum(e["owner"] == B for e in stored()) == 10)
+    # --- limit: default 5 (A), SKIP_TVS_LIMITS overrides above (B: 7) and below (C: 2) the default
+    check("limits parsed from the environment", (main.ISBTV.skip_tv_limit, main.ISBTV.skip_tv_limits) == (5, {B: 7, CC: 2}))
+    for who, n in (("A", 5), ("B", 7), ("C", 2)):
+        for i in range(n):
+            r = add(f"{who}{i}", who)
+            check(f"{who} adds TV {i + 1}", r.status_code == 200, r.text)
+        r = add(f"{who}X", who)
+        check(f"{who}: TV {n + 1} is 409 too_many_devices naming {n}", r.status_code == 409
+              and r.json()["reason"] == "too_many_devices" and f"up to {n} Sponsor Block only TV" in r.json()["detail"], r.text)
+        check(f"{who}: re-adding one at the limit still works", add(f"{who}0", who).status_code == 200)
+        check(f"{who}: a refused add stored nothing", sum(e["owner"] == ANSWER_IDS[who] for e in stored()) == n)
+    c.delete("/skip-tvs/scr-A4", headers=H("A"))
 
     # --- a failed save rolls the add back
     real = main.write_atomic
@@ -298,6 +305,22 @@ with TestClient(main.app) as c:
         (A, "scr-OK"): {"owner": A, "screen_id": "scr-OK", "name": "Ok", "custom_name": "Mine"},
         (B, "scr-NONAME"): {"owner": B, "screen_id": "scr-NONAME", "name": "TV"}}, main.skip_tvs)
 
+# ---------- bad limit settings stop startup; blanks are ignored
+base = {"ISPONSORBLOCKTV_CONFIG": "/x/config.json"}
+check("defaults: 5 and no overrides", (isbtv.from_env(base).skip_tv_limit, isbtv.from_env(base).skip_tv_limits) == (5, {})
+      and isbtv.from_env(dict(base, SKIP_TVS_LIMIT=" ", SKIP_TVS_LIMITS=" , ")).limit_for("x") == 5)
+check("limit_for: override or default", isbtv.from_env(dict(base, SKIP_TVS_LIMIT="8", SKIP_TVS_LIMITS="p=3")).limit_for("p") == 3
+      and isbtv.from_env(dict(base, SKIP_TVS_LIMIT="8", SKIP_TVS_LIMITS="p=3")).limit_for("q") == 8)
+check("limits are not written into config.json", "skip_tv_limit" not in isbtv.from_env(base).settings)
+for bad in ({"SKIP_TVS_LIMIT": "abc"}, {"SKIP_TVS_LIMIT": "0"}, {"SKIP_TVS_LIMIT": "2.5"}, {"SKIP_TVS_LIMIT": "-1"},
+            {"SKIP_TVS_LIMITS": "p=abc"}, {"SKIP_TVS_LIMITS": "p=0"}, {"SKIP_TVS_LIMITS": "p"}, {"SKIP_TVS_LIMITS": "=3"},
+            {"SKIP_TVS_LIMITS": "p=1.5"}):
+    try:
+        isbtv.from_env(dict(base, **bad)); ok = False
+    except ValueError as ex:
+        ok = "SKIP_TVS_LIMIT" in str(ex)
+    check(f"{bad} refused at startup with a clear error", ok)
+
 # ---------- the import script
 SCRIPT = str(Path(REPO) / "scripts" / "import_skip_tvs.py")
 IMP = Path(tempfile.mkdtemp())
@@ -336,6 +359,15 @@ check("import: no temp files left", sorted(x.name for x in IMP.iterdir()) == ["d
 (IMP / "skip_tvs.json").write_text("{{{")
 p = imp()
 check("import: refuses to overwrite a corrupt skip_tvs.json", p.returncode != 0 and (IMP / "skip_tvs.json").read_text() == "{{{", p.stdout + p.stderr)
+# exempt from the limit, but warns
+big = IMP / "big.json"
+big.write_text(json.dumps([{"name": f"T{i}", "screen_id": f"scr-FAKEBIG-{i:04d}"} for i in range(4)]))
+(IMP / "skip_tvs.json").write_text(json.dumps(second))
+p = subprocess.run([sys.executable, "-I", SCRIPT, str(big), "--owner", A, "--data", str(IMP)],
+                   capture_output=True, text=True, timeout=60, env=dict(os.environ, SKIP_TVS_LIMIT="3", SKIP_TVS_LIMITS=""))
+check("import: over the limit still imports, with a warning", p.returncode == 0 and len(json.loads((IMP / "skip_tvs.json").read_text())) == 6
+      and "warning" in p.stdout.lower() and "limit of 3" in p.stdout, p.stdout + p.stderr)
+(IMP / "skip_tvs.json").write_text(json.dumps(second))
 # the server reads what the script wrote
 (IMP / "skip_tvs.json").write_text(json.dumps(second))
 main.SKIP_TVS_FILE = IMP / "skip_tvs.json"

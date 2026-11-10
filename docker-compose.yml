@@ -30,6 +30,8 @@ services:
       # Skip sponsors: on because this is set. The rest are iSponsorBlockTV's settings (isbtv.py).
       ISPONSORBLOCKTV_CONFIG: /isbtv/config.json
       SKIP_HIDDEN_PERSON_IDS: ${SKIP_HIDDEN_PERSON_IDS:-}  # comma-separated Canopy person ids (App Review)
+      SKIP_TVS_LIMIT: ${SKIP_TVS_LIMIT:-5}  # Sponsor Block only TVs per person
+      SKIP_TVS_LIMITS: ${SKIP_TVS_LIMITS:-}  # per-person overrides: <person id>=<n>,<person id>=<n>
       SKIP_CATEGORIES: ${SKIP_CATEGORIES:-sponsor,selfpromo,music_offtopic}
       SKIP_ADS: ${SKIP_ADS:-true}
       MUTE_ADS: ${MUTE_ADS:-false}
