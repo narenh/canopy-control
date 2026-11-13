@@ -301,26 +301,32 @@ with TestClient(main.app) as c:
     check("coming back playing push-starts again", ("start", PTS1) in events(b), b)
     d1 = show(I1, "scr-LIVEDEN")
 
-    # ---------- the session ends but the TV comes back playing (bind response or nowPlaying answer)
-    for in_bind, label in ((False, "nowPlaying answer"), (True, "bind response")):
+    # ---------- routine session ends (YouTube's, every ~5 min) that reconnect: nothing scheduled, whatever
+    # the TV reports after (Playing in the bind response or the nowPlaying answer, Paused, nothing at
+    # all for a video that keeps playing, or a nowPlaying with only a listId: no video)
+    for now, in_bind, label in ((("x1", State.Playing), False, "nowPlaying answer"), (("x1", State.Playing), True, "bind response"),
+                                (("x1", State.Paused), False, "Paused"), (None, False, "nothing reported"),
+                                ((None, None), False, "no-video nowPlaying answer")):
         Logs.records[:] = []
-        DEN.api.in_bind, n = in_bind, DEN.api.connects
+        DEN.api.now, DEN.api.in_bind, n = now, in_bind, DEN.api.connects
         run(DEN.api.drop.set)
         check(f"session cycle ({label}): reconnects", wait_for(lambda: DEN.api.connects == n + 1, 3))
         past_grace()
-        check(f"session cycle ({label}): scheduled, then cancelled by the reconnect's Playing",
-              len(logs("stopped playing (session ended)")) == 1 and len(logs("within the grace period")) == 1,
-              [r.getMessage() for r in Logs.records if "lounge event" not in r.getMessage()])
-        check(f"session cycle ({label}): no end", ends() == [] and stored()[I1]["activity"]["token"] == d1)
+        check(f"session cycle ({label}): nothing scheduled, no end", logs("stopped playing") == [] and ends() == []
+              and stored()[I1]["activity"]["token"] == d1, [r.getMessage() for r in Logs.records if "lounge event" not in r.getMessage()])
+    check("no-video nowPlaying within RECONNECT_QUIET_S of connecting: kept, logged",
+          len(logs("no video in nowPlaying just after connecting")) == 1 and DEN.video_id == "x1",
+          [r.getMessage() for r in Logs.records])
     DEN.api.in_bind = False
 
-    # ---------- the session ends and the TV comes back Paused: still showing a video, not stopping
+    # ---------- the same nowPlaying with no video after RECONNECT_QUIET_S: the user left the video
     Logs.records[:] = []
-    DEN.api.now, n = ("x1", State.Paused), DEN.api.connects
-    run(DEN.api.drop.set)
-    check("session cycle (Paused): reconnects", wait_for(lambda: DEN.api.connects == n + 1, 3)); past_grace()
-    check("session cycle (Paused): cancelled, no end", ends() == [] and stored()[I1]["activity"]["token"] == d1
-          and len(logs("reported Paused within the grace period")) == 1, [r.getMessage() for r in Logs.records])
+    DEN._connected_at -= main.RECONNECT_QUIET_S
+    nowp(DEN, None, None)
+    check("no video after RECONNECT_QUIET_S: scheduled", len(logs("stopped playing (no video)")) == 1, [r.getMessage() for r in Logs.records])
+    check("no video after RECONNECT_QUIET_S: ends", wait_for(lambda: any(x["event"] == "end" for x in relay_hits), 3)); drain()
+    check("  the end", [x["device_token"] for x in ends()] == [d1] and stored()[I1]["activity"] is None)
+    nowp(DEN, "x1", State.Playing); drain(); take(); d1 = show(I1, "scr-LIVEDEN")
 
     # ---------- our own forced resubscribe while playing: nothing scheduled, nothing ended
     DEN.api.now, n = ("x1", State.Playing), DEN.api.connects

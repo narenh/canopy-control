@@ -69,10 +69,13 @@ TVs starts playing (a new video, or the first Playing after the session connects
 without), each of their installs gets an update if its activity already shows that TV (and is
 under 8 h old), else a push-to-start (at most one per install and TV per 2 min). Speed, captions,
 connection and name changes go to the activities showing that TV, debounced 0.5 s. When a TV stops
-playing (video ended, Stopped, nowPlaying with no video, YouTube closed or the session ended) and
-doesn't play again (Playing/Starting; or Paused, after a dropped session) within
-LIVE_ACTIVITY_END_GRACE_S, the activities showing it are ended (dismissed now) and forgotten, as
-when the TV is removed. Paused alone isn't stopping; a forced _resubscribe() doesn't count.
+playing (video ended, Stopped, nowPlaying with no video, YouTube closed, or the session ended and
+reconnecting failed) and doesn't play again (Playing/Starting; or Paused, after a dropped session)
+within LIVE_ACTIVITY_END_GRACE_S, the activities showing it are ended (dismissed now) and
+forgotten, as when the TV is removed. Paused alone isn't stopping; a forced _resubscribe() doesn't
+count, nor does a session end that reconnects (YouTube ends them every ~5 min; a video that keeps
+playing reports nothing new), nor a nowPlaying with no video within RECONNECT_QUIET_S of
+connecting while we know the TV's video (the TV's answer to our getNowPlaying).
 
 Env: CANOPY_ACCOUNT_KEY (required; the site key from the Account Manager's Sites tab),
 CANOPY_ACCOUNT_URL (default https://account.canopysf.com), DATA_DIR (default /data),
@@ -125,6 +128,7 @@ AUTOPLAY_WINDOW_S = 5  # a different video this soon after one ended is an autop
 AUTOPLAY_PAUSE_WINDOW_S = 15  # it's paused when it first plays within this long of the switch
 PLAY_IDLE_S = 30 * 60  # Playing again after this long without counts as starting to play
 LIVE_ACTIVITY_END_GRACE_S = 60  # a TV that stopped playing has this long to play again before its activities end
+RECONNECT_QUIET_S = 15  # a nowPlaying with no video this soon after connecting answers our getNowPlaying: not a stop
 log = logging.getLogger("yt-speed")
 logging.basicConfig(level=logging.INFO)
 ISBTV = isbtv.from_env(os.environ)  # None: skip sponsors is off
@@ -164,6 +168,8 @@ class Device(EventListener):
         self._stopped_at = 0.0  # when it last stopped being Playing (live.clock time)
         self._end_task: asyncio.Task | None = None  # pending end of its activities (see _stopping)
         self._end_why = ""  # what that end is for
+        self._dropped: str | None = None  # a session dropped and we haven't reconnected yet: why (see _loop)
+        self._connected_at = float("-inf")  # last successful connect (time.monotonic)
         self._short_task: asyncio.Task | None = None  # see _check_short
         # autoplay guard (see _autoplay_check)
         self._ended_at = float("-inf")  # when the TV last reported a video ended (time.monotonic)
@@ -281,7 +287,7 @@ class Device(EventListener):
         """Starting to play: Playing a different video than the last one reported Playing, or the
         first Playing since the session (re)connected or after PLAY_IDLE_S without Playing.
         Stopping (see _stopping): the video ended, Stopped, or a nowPlaying with no video (`video`
-        false). Paused is neither, but playing again after a pause counts as starting: if the
+        false; not within RECONNECT_QUIET_S of connecting if we know its video). Paused is neither, but playing again after a pause counts as starting: if the
         Live Activity never showed up (or was swiped away), unpausing brings it back; if it's
         showing, it just gets an update (live.started_playing decides, and rate-limits starts)."""
         try:
@@ -291,6 +297,12 @@ class Device(EventListener):
                 self._playing_again(state.name)
             elif state == State.Paused and video:
                 self._playing_again("Paused", connection_only=True)
+            elif (not video and self.video_id
+                  and time.monotonic() - self._connected_at < RECONNECT_QUIET_S):
+                # The TV answering our getNowPlaying with only a listId while it plays: not a stop.
+                log.info("%s: no video in nowPlaying just after connecting: keeping %s",
+                         self.display_name, self.video_id)
+                return
             elif state in (State.Buffering, State.Stopped) or not video:
                 # pyytlounge's Buffering is YouTube's state 0, "ended" (see pyytlounge/models.py)
                 self._stopping("no video" if not video else "ended" if state == State.Buffering else "stopped")
@@ -544,6 +556,7 @@ class Device(EventListener):
                 was_connected = self.api.connected()
                 if await self.api.connect():
                     up = True
+                    self._dropped, self._connected_at = None, time.monotonic()
                     if not was_connected:
                         self._fresh = True
                     if self.api.screen_name and self.name != self.api.screen_name:
@@ -554,15 +567,19 @@ class Device(EventListener):
                     await self.api.get_now_playing()
                     await self._subscribe()  # blocks until the session drops
                     log.info("session ended: %s", self.display_name)
-                    # Often routine: the next session's nowPlaying/Playing cancels this. Our own
+                    # Routine every ~5 min, and a video that keeps playing reports nothing after the
+                    # reconnect: only a failed reconnect counts as stopping (below). Our own
                     # _resubscribe() cancels this task instead, so it never gets here.
-                    self._stopping("session ended")
+                    self._dropped = "session ended"
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
                 log.warning("%s session error: %s", self.display_name, ex)
                 if up:
-                    self._stopping("session error")
+                    self._dropped = "session error"
+            if not up and self._dropped:  # the session dropped and reconnecting failed
+                self._stopping(self._dropped)
+                self._dropped = None
             self._changed()
             # YouTube ends sessions every few minutes. Reconnect at once after one that lasted: the
             # TV announces a video only when it starts (asked later, it may answer with no video),
