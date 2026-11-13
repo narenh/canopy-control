@@ -5,6 +5,7 @@
 #   - isponsorblocktv runs as 10001 with a read-only root fs and config mount, no capabilities,
 #     no-new-privileges; with no devices the wrapper doesn't start iSponsorBlockTV
 #   - api's rendering code writes a (dummy) device: iSponsorBlockTV starts and keeps running
+#   - it runs patched to bind with its own remote id (see docker-compose.yml), checked in the image
 #   - another change restarts it; stopping the container stops it cleanly
 # Usage: tests/smoke_compose.sh   (needs docker compose; leaves nothing behind)
 set -eu
@@ -78,6 +79,46 @@ wait_log isponsorblocktv "starting iSponsorBlockTV for 1 device(s)" 15 || fail "
 sleep 15
 dc logs --no-color isponsorblocktv 2>&1 | grep -qE "exited with code|Traceback|Read-only|Permission denied" && fail "iSponsorBlockTV failed"
 ok "a device: iSponsorBlockTV started and is still running after 15 s"
+# The remote id patch: logged by the running iSponsorBlockTV (a line of its own, not the wrapper's
+# echo of the command, which contains the same text).
+dc logs --no-color isponsorblocktv 2>&1 | grep -qE '\| \[patch\] iSponsorBlockTV binds with its own remote id$' \
+  || fail "the remote id patch wasn't applied"
+# Against this image: connect() posts a body whose id is a stable UUID, not the screen id, and
+# distinct per TV; our copy of connect() is upstream's but for remote_id. Unpatched, upstream sends
+# the screen id: checked too, so this can't pass vacuously. A stubbed session: nothing leaves.
+BOOT=$(dc config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["isponsorblocktv"]["command"][3])')
+ids=$(dc exec -T isponsorblocktv python3 -c "$BOOT
+import asyncio, logging
+SCREEN = 'smoke0test0screen0id0not0a0real0tv0aaaaaaaaaa'
+class Resp:
+    status, reason = 500, 'stub'
+    async def text(self): return ''
+    async def __aenter__(self): return self
+    async def __aexit__(self, *exc): return False
+class Session:
+    def __init__(self): self.ids = []
+    def post(self, url, data):
+        self.ids.append(data['id'])
+        return Resp()
+async def sent(screen):
+    api = Api(screen_id=screen, logger=logging.getLogger('check'))
+    api.auth.lounge_id_token = 'dummy'
+    api.session = Session()
+    for _ in range(2):
+        await api.connect()
+    return api.session.ids
+patched, other = asyncio.run(sent(SCREEN)), asyncio.run(sent(SCREEN + 'b'))
+copy = connect.__code__
+same_copy = ({c for c in copy.co_consts if isinstance(c, str)} == V2_11_0_STRS
+             and set(copy.co_names) ^ set(V2_11_0_NAMES) == {'remote_id'})
+Api.connect = original
+unpatched = asyncio.run(sent(SCREEN))
+good = (len(patched) == 2 and patched[0] == patched[1] != SCREEN and str(uuid.UUID(patched[0])) == patched[0]
+        and other[0] != patched[0] and unpatched == [SCREEN, SCREEN] and same_copy)
+print('ok' if good else 'patched=%s other=%s unpatched=%s copy=%s' % (patched, other, unpatched, same_copy))
+" --patch-only 2>/dev/null | tail -1)
+[ "$ids" = ok ] || fail "remote id patch: $ids"
+ok "the remote id patch applies to this image: a stable id of its own per TV (upstream alone sends the screen id)"
 
 # --- a change restarts it
 [ "$(render 'Smoke TV 2')" = True ] || fail "api couldn't rewrite the config"

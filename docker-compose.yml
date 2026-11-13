@@ -1,5 +1,6 @@
 # Canopy Control: the API (the only service exposed; Coolify routes its domain to api:8000) and an
-# unmodified upstream iSponsorBlockTV that skips sponsors on the TVs people turn it on for.
+# upstream iSponsorBlockTV image (one method patched at runtime, see its command) that skips sponsors
+# on the TVs people turn it on for.
 #
 # api owns iSponsorBlockTV's config.json on the shared isbtv-config volume (read-only for
 # isponsorblocktv) and rewrites it, atomically and only on a change, when a TV's "Skip sponsors"
@@ -127,7 +128,114 @@ services:
             time.sleep(POLL_S)
         stop_child()
         log("stopped")
-    command: ["python3", "-u", "main.pyc"]
+    # The image's main.pyc, run by a few lines that first make iSponsorBlockTV bind to each TV's
+    # Lounge with a remote id of its own. v2.11.0's connect() sends the TV's own screen id as its
+    # remote "id" (our api had the same problem with pyytlounge: see lounge.py), which we suspect
+    # knocks the TV's YouTube app out of its own session. connect() below is v2.11.0's, unchanged
+    # but for "id": a stable uuid5 per TV. It's swapped in only if upstream's still compiles to
+    # v2.11.0's strings and names; otherwise it logs that and runs unpatched. The CI smoke test
+    # checks the patch against the pinned image. No $ in it (compose would interpolate it).
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import runpy, sys, uuid
+        from iSponsorBlockTV import ytlounge
+        Api = ytlounge.YtLoungeApi
+        original = Api.connect
+        REMOTE_ID_NS = uuid.UUID("c9d837e6-a56b-4605-ba6f-bc39a6d9e93c")
+        # v2.11.0's connect(), compiled by the image's Python: its string constants and names
+        V2_11_0_STRS = {
+            "/bc/bind", "1", "3", "8", "Attempt to connect using the previously set tokens", "CVER",
+            "Connection denied", "Connection denied, attempting to circumvent the issue",
+            "Handle connect failed, status %s reason %s", "MDX_SESSION_SOURCE_UNKNOWN", "Not linked",
+            "REMOTE_CONTROL", "RID", "TYPE", "Unknown reply to connect %i %s", "VER", "app",
+            "capabilities", "cl", "connectParams", "device", "false", "id", "loungeIdToken", "manual",
+            "mdx-version", "name", "pairing_type", "que,dsdtr,atp,vsp", "sessionSource", "theme", "ui",
+            "xmlhttp", "ytios-phone-20.15.1", '{"setStatesParams": "{"playbackSpeed":0}"}',
+        }
+        V2_11_0_NAMES = (
+            "linked", "NotLinkedException", "auth", "screen_id", "lounge_id_token", "device_name",
+            "api_base", "session", "post", "text", "status", "_logger", "warning", "connect_as_screen",
+            "reason", "splitlines", "_parse_event_chunks", "as_aiter", "_process_events",
+            "_command_offset", "connected", "exception",
+        )
+
+
+        def remote_id(screen_id):
+            """Stable across restarts, distinct per TV, never the TV's own id (nor our api's)."""
+            return str(uuid.uuid5(REMOTE_ID_NS, "isponsorblocktv:" + screen_id))
+
+
+        async def connect(self) -> bool:
+            """Attempt to connect using the previously set tokens"""
+            if not self.linked():
+                raise NotLinkedException("Not linked")
+
+            connect_body = {
+                "id": remote_id(self.auth.screen_id),
+                "mdx-version": "3",
+                "TYPE": "xmlhttp",
+                "theme": "cl",
+                "sessionSource": "MDX_SESSION_SOURCE_UNKNOWN",
+                "connectParams": '{"setStatesParams": "{"playbackSpeed":0}"}',
+                "RID": "1",
+                "CVER": "1",
+                "capabilities": "que,dsdtr,atp,vsp",
+                "ui": "false",
+                "app": "ytios-phone-20.15.1",
+                "pairing_type": "manual",
+                "VER": "8",
+                "loungeIdToken": self.auth.lounge_id_token,
+                "device": "REMOTE_CONTROL",
+                "name": self.device_name,
+            }
+            connect_url = f"{api_base}/bc/bind"
+            async with self.session.post(url=connect_url, data=connect_body) as resp:
+                try:
+                    text = await resp.text()
+                    if resp.status == 401:
+                        if "Connection denied" in text:
+                            self._logger.warning(
+                                "Connection denied, attempting to circumvent the issue"
+                            )
+                            await self.connect_as_screen()
+                        # self._lounge_token_expired()
+                        return False
+
+                    if resp.status != 200:
+                        self._logger.warning("Unknown reply to connect %i %s", resp.status, resp.reason)
+                        return False
+                    lines = text.splitlines()
+                    async for events in self._parse_event_chunks(as_aiter(lines)):
+                        await self._process_events(events)
+                    self._command_offset = 1
+                    return self.connected()
+                except:
+                    self._logger.exception(
+                        "Handle connect failed, status %s reason %s",
+                        resp.status,
+                        resp.reason,
+                    )
+                    raise
+
+
+        try:
+            from iSponsorBlockTV.ytlounge import NotLinkedException, api_base, as_aiter
+            code = original.__code__
+            same = ({c for c in code.co_consts if isinstance(c, str)} == V2_11_0_STRS
+                    and code.co_names == V2_11_0_NAMES)
+        except Exception:
+            same = False
+        if same:
+            Api.connect = connect
+            print("[patch] iSponsorBlockTV binds with its own remote id", flush=True)
+        else:
+            print("[patch] iSponsorBlockTV's connect changed: running it unpatched", flush=True)
+        if sys.argv[1:] != ["--patch-only"]:
+            sys.argv = ["main.pyc"]
+            runpy.run_path("main.pyc", run_name="__main__")
     stop_grace_period: 20s
     # api first: it creates the shared volume (owned by 10001, from its image) and the config
     depends_on: [api]
