@@ -147,6 +147,11 @@ class Device(EventListener):
         self.custom_name = custom_name  # what its owner renamed it to, if they did
         self.skip_sponsors = skip_sponsors  # its owner wants iSponsorBlockTV on it
         self.api = LoungeApi("Speed Remote", self, owner)  # its own remote id: see lounge.py
+        # whether the TV's YouTube app is in the Lounge session (see _note_lounge_status)
+        self._tv_in_session: bool | None = None  # None: no loungeStatus since the last connect
+        self._session_remotes: list[str] = []  # the other devices in it: "name (type)"
+        self._presence_logged: object = None  # last state logged since the connect; None: not yet
+        self._watch_presence()
         if LOG_LOUNGE_EVENTS:
             self._log_raw_events()
         self.task: asyncio.Task | None = None
@@ -404,6 +409,47 @@ class Device(EventListener):
 
         self.api._process_event = logged
 
+    def _watch_presence(self):
+        """Wrap pyytlounge's event dispatch to note each loungeStatus (see _note_lounge_status)."""
+        dispatch = getattr(self.api, "_process_event", None)
+        if dispatch is None:  # a test fake: nothing to wrap
+            return
+
+        async def watched(event_type, args):
+            if event_type == "loungeStatus":
+                try:
+                    self._note_lounge_status(args[0] if args else {})
+                except Exception as ex:
+                    log.warning("%s: couldn't read loungeStatus: %s", self.display_name, ex)
+            return await dispatch(event_type, args)
+
+        self.api._process_event = watched
+
+    def _note_lounge_status(self, status: dict):
+        """Whether the TV's YouTube app is in the session: loungeStatus lists the session's devices
+        (a JSON string), the TV's app as a LOUNGE_SCREEN. A session with only remotes in it gets no
+        playback events. Logged after each connect (_log_presence) and on a change in between."""
+        devices = status.get("devices") or "[]"
+        if isinstance(devices, str):
+            devices = json.loads(devices)
+        present = any(d.get("type") == "LOUNGE_SCREEN" for d in devices)
+        self._tv_in_session = present
+        self._session_remotes = [f"{d.get('name') or '?'} ({d.get('type') or '?'})"
+                                 for d in devices if d.get("type") != "LOUNGE_SCREEN"]
+        if self._presence_logged is not None and self._presence_logged != present:
+            self._log_presence()
+
+    def _log_presence(self):
+        state = self._tv_in_session
+        if state is None:
+            log.info("%s: YouTube app presence unknown (no loungeStatus yet)", self.display_name)
+        elif state:
+            log.info("%s: YouTube app in the session", self.display_name)
+        else:
+            log.info("%s: YouTube app NOT in the session (only remotes: %s)", self.display_name,
+                     ", ".join(self._session_remotes) or "none")
+        self._presence_logged = "unknown" if state is None else state
+
     async def subtitles_track_changed(self, e):
         log.info("%s captions: video=%s lang=%r kind=%r", self.display_name, e.video_id, e.language_code, e.kind)
         # The TV sometimes reports nowPlaying with no video (e.g. after a reconnect) while this
@@ -554,6 +600,7 @@ class Device(EventListener):
                     await self.api.refresh_auth()
                     save_devices()
                 was_connected = self.api.connected()
+                self._tv_in_session, self._presence_logged = None, None  # its loungeStatus is in the connect
                 if await self.api.connect():
                     up = True
                     self._dropped, self._connected_at = None, time.monotonic()
@@ -563,6 +610,7 @@ class Device(EventListener):
                         self.name = self.api.screen_name
                         save_devices()
                     log.info("connected to %s (TV %s)", self.display_name, self.id[:8])
+                    self._log_presence()
                     self._changed()
                     await self.api.get_now_playing()
                     await self._subscribe()  # blocks until the session drops
