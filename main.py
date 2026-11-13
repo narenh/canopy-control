@@ -20,10 +20,17 @@ DELETE /skip-tvs/{id}             - forget one: {"removed": id}
 POST   /devices/{id}/speed/{x}    - x in 1, 1.25, 1.5, 1.75, 2; with the caller's auto_captions on,
                                    also captions on above 1, off at 1; off: only the speed
 POST   /devices/{id}/captions/{on|off}   - last of slider/toggle wins, re-applied to each new video
+                                   (with the TV owner's captions_always on: this video only)
 POST   /devices/{id}/playback/{play|pause} - 409 with no video; waits briefly for the TV to confirm
-GET    /me/settings               - the caller's settings: {"auto_captions": bool} (default true)
-PATCH  /me/settings {"auto_captions": bool} - change them (strict bool; {} is 422); returns all of
-                                   them. Stored per person in settings.json, only non-defaults.
+GET    /me/settings               - the caller's settings: {"auto_captions": bool (default true),
+                                   "captions_always": bool (default false)}
+PATCH  /me/settings {"auto_captions": bool, "captions_always": bool} - change either or both
+                                   (strict bools; {} is 422); returns all of them. Stored per person
+                                   in settings.json, only non-defaults. The two are exclusive: turning
+                                   one on turns the other off; both true is 422.
+                                   captions_always: every new video on the person's TVs gets captions
+                                   on, whatever the speed (and speed requests don't touch captions);
+                                   the toggle still works for the current video.
 PUT    /installs/{uuid}           - an app install's Live Activity tokens (see below)
 DELETE /installs/{uuid}           - forget an install (the app's sign-out)
 
@@ -39,7 +46,8 @@ fetched, with no video, or when oEmbed has none (private/unembeddable; retried a
 
 Shorts (shorts.py): when a TV's video turns out to be a Short (youtube.com/shorts/<id> answers 200,
 not a redirect), it's set to 1x with captions off, and want_captions goes off too. Nothing is
-restored after the Short: the next video plays at 1x without captions until someone changes it.
+restored after the Short: the next video plays at 1x without captions until someone changes it,
+except with the owner's captions_always on: the next regular video gets captions on again.
 
 Autoplay guard: YouTube on Apple TV plays the next video when one ends even with autoplay off (it
 reports ended, then a new video, with no command from anyone). When a TV reports a different video
@@ -507,12 +515,13 @@ class Device(EventListener):
 
     async def _auto_caption(self):
         """The TV keeps the speed across videos but not captions, so re-apply the last choice per video."""
-        if self.want_captions is None or not self.video_id or self.video_id == self._auto_captioned:
+        want = True if person_settings(self.owner)["captions_always"] else self.want_captions
+        if want is None or not self.video_id or self.video_id == self._auto_captioned:
             return
         self._auto_captioned = self.video_id
         try:
             # Don't wait for the change here: the TV's reply arrives through this same event loop.
-            await self._send_captions(self.want_captions)
+            await self._send_captions(want)
         except Exception as ex:
             log.warning("%s auto-captions failed: %s", self.display_name, ex)
 
@@ -528,7 +537,8 @@ class Device(EventListener):
 
     async def _reset_for_short(self, video_id: str):
         """A Short plays at 1x with captions off. Nothing is restored after it: the next video
-        stays at 1x, and auto-captions (want_captions) stays off, as if the slider had gone to 1x."""
+        stays at 1x, and auto-captions (want_captions) stays off, as if the slider had gone to 1x.
+        With the owner's captions_always on, _auto_caption still turns them on for the next video."""
         try:
             if await shorts_check.is_short(video_id) is not True or self.video_id != video_id:
                 return
@@ -701,12 +711,15 @@ def save_devices():
     render_isbtv()
 
 
-DEFAULT_SETTINGS = {"auto_captions": True}
+DEFAULT_SETTINGS = {"auto_captions": True, "captions_always": False}
 settings: dict[str, dict] = {}  # person id -> the settings they changed from DEFAULT_SETTINGS
 
 
 def person_settings(person_id: str) -> dict:
-    return {**DEFAULT_SETTINGS, **settings.get(person_id, {})}
+    s = {**DEFAULT_SETTINGS, **settings.get(person_id, {})}
+    if s["captions_always"]:  # exclusive (PATCH keeps them so; this covers a hand-edited file)
+        s["auto_captions"] = False
+    return s
 
 
 def write_atomic(path: Path, text: str):
@@ -1144,6 +1157,7 @@ async def set_speed(device_id: str, speed: float, person: dict = Depends(require
     d = get(person["id"], device_id)
     # The sender's setting (d is theirs). Off: only the speed changes; no caption command, and
     # want_captions stays as the last control (the toggle, or the slider while it was on) left it.
+    # captions_always: auto_captions is off (they're exclusive), so speed doesn't touch captions.
     auto = person_settings(person["id"])["auto_captions"]
     await d.set_speed(speed)
     if auto:
@@ -1178,13 +1192,17 @@ async def set_playback(device_id: str, action: str, person: dict = Depends(requi
 
 class SettingsPatch(BaseModel):
     auto_captions: StrictBool | None = None  # true or false; null is refused below
+    captions_always: StrictBool | None = None
 
     @model_validator(mode="after")
     def _some(self):
         if not self.model_fields_set:
-            raise ValueError("send auto_captions")
-        if self.auto_captions is None:
-            raise ValueError("auto_captions must be true or false")
+            raise ValueError("send auto_captions or captions_always")
+        for k in self.model_fields_set:
+            if getattr(self, k) is None:
+                raise ValueError(f"{k} must be true or false")
+        if self.auto_captions and self.captions_always:
+            raise ValueError("auto_captions and captions_always can't both be on")
         return self
 
 
@@ -1197,6 +1215,11 @@ async def get_settings(person: dict = Depends(require_person)):
 async def patch_settings(body: SettingsPatch, person: dict = Depends(require_person)):
     pid = person["id"]
     new = {**person_settings(pid), **{k: getattr(body, k) for k in body.model_fields_set}}
+    # Exclusive: whichever one this PATCH turns on turns the other off.
+    if body.captions_always:
+        new["auto_captions"] = False
+    elif body.auto_captions:
+        new["captions_always"] = False
     changed = {k: v for k, v in new.items() if v != DEFAULT_SETTINGS[k]}
     if changed != settings.get(pid, {}):
         old = settings.get(pid)

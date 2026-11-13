@@ -25,10 +25,12 @@ There is no web UI any more. `/docs` and `/openapi.json` are FastAPI's.
 
 All four `/skip-tvs` routes answer 403 `skip_not_allowed` to a hidden person, or when the feature is off.
 - `POST /devices/{id}/speed/{x}` — x in 1, 1.25, 1.5, 1.75, 2. With your `auto_captions` setting on (the default), also captions on above 1x, off at 1x (`CAPTION_LANG`, default `en`). With it off, only the speed changes: no caption command, and the caption choice re-applied to new videos stays as it was.
-- `POST /devices/{id}/captions/{on|off}` — manual caption toggle, whatever `auto_captions` is; 409 if the TV does not confirm the change. Whichever of slider (while `auto_captions` is on) and toggle was used last wins and is re-applied to each new video
+- `POST /devices/{id}/captions/{on|off}` — manual caption toggle, whatever `auto_captions` is; 409 if the TV does not confirm the change. Whichever of slider (while `auto_captions` is on) and toggle was used last wins and is re-applied to each new video (with the TV owner's `captions_always` on, the toggle only lasts for the current video)
 - `POST /devices/{id}/playback/{play|pause}` — play or pause; 409 `no video playing` without a video. Waits up to 1.5 s for the TV to report the change; if it doesn't, the answer says what was asked for and the TV's next report corrects it.
-- `GET /me/settings` — your settings: `{"auto_captions": true}` (the default).
-- `PATCH /me/settings {"auto_captions": true|false}` — change them; returns the full settings object. A strict boolean; `{}`, `null` or another type is 422. Stored per person in `settings.json` in `/data` (only values that differ from the defaults; written atomically). The setting is the caller's: on a TV two people paired, each person's speed requests follow their own.
+- `GET /me/settings` — your settings: `{"auto_captions": true, "captions_always": false}` (the defaults).
+  - `auto_captions`: speed requests also turn captions on above 1x and off at 1x (see above).
+  - `captions_always`: every new video on your TVs gets captions on, whatever the speed; speed requests don't touch captions. The manual toggle still works for the current video; the next one gets captions on again.
+- `PATCH /me/settings {"auto_captions": true|false, "captions_always": true|false}` — change either or both; returns the full settings object. The two are exclusive: turning one on turns the other off in the same PATCH, and both `true` is 422. Strict booleans; `{}`, `null` or another type is 422. Stored per person in `settings.json` in `/data` (only values that differ from the defaults; written atomically). The setting is the caller's: on a TV two people paired, each person's speed requests follow their own.
 
 Errors are `{"detail": "<sentence>"}`; the auth and limit ones add `"reason"`:
 
@@ -45,7 +47,7 @@ Others (no `reason`): 404 `unknown device`, 404 `unknown install`, 503 `<TV> not
 
 ## Shorts
 
-When a TV's video turns out to be a Short, the server sets that TV to 1x with captions off, and turns its auto-captions choice off too. Nothing is restored afterwards: the next video stays at 1x without captions until someone changes it. `shorts.py` asks `HEAD https://www.youtube.com/shorts/<id>` without following redirects: 200 is a Short, a redirect (303, to `/watch`) isn't. That's YouTube's behavior, not a documented API, so any other answer (404, a timeout) means "can't tell" and nothing is changed. Answers are cached per id (the 500 most recent); "can't tell" isn't.
+When a TV's video turns out to be a Short, the server sets that TV to 1x with captions off, and turns its auto-captions choice off too. Nothing is restored afterwards: the next video stays at 1x without captions until someone changes it. The exception is the TV owner's `captions_always`: the next regular video gets captions on again. `shorts.py` asks `HEAD https://www.youtube.com/shorts/<id>` without following redirects: 200 is a Short, a redirect (303, to `/watch`) isn't. That's YouTube's behavior, not a documented API, so any other answer (404, a timeout) means "can't tell" and nothing is changed. Answers are cached per id (the 500 most recent); "can't tell" isn't.
 
 On the TV, a Short ends the Lounge session (`loungeScreenDisconnected`, reason `disconnectedByUserScreenInitiated`); after the reconnect, a captions event names the Short, and that's when the check runs.
 

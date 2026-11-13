@@ -1,4 +1,4 @@
-"""Per-person settings (GET/PATCH /me/settings, auto_captions) and video title/channel in DeviceInfo.
+"""Per-person settings (GET/PATCH /me/settings, auto_captions, captions_always) and video title/channel in DeviceInfo.
 
 python -I tests/test_settings.py [repo path, default: this repo]
 
@@ -181,28 +181,28 @@ with TestClient(main.app) as c:
                                                          headers=H("N")).status_code == 401)
     check("no settings.json before any change", stored() is None)
     r = me()
-    check("GET default is auto_captions true", r.status_code == 200 and r.json() == {"auto_captions": True}, r.text)
+    check("GET default is auto_captions true", r.status_code == 200 and r.json() == {"auto_captions": True, "captions_always": False}, r.text)
     for body in ({}, {"auto_captions": None}, {"auto_captions": "false"}, {"auto_captions": 0}, {"auto_captions": 1},
                  {"other": True}, [], "x"):
         r = set_me(body)
         check(f"PATCH {body!r} is 422", r.status_code == 422, (r.status_code, r.text))
     r = c.patch("/me/settings", headers=H("A"))
     check("PATCH with no body is 422", r.status_code == 422, r.text)
-    check("refused PATCHes stored nothing", stored() is None and me().json() == {"auto_captions": True})
+    check("refused PATCHes stored nothing", stored() is None and me().json() == {"auto_captions": True, "captions_always": False})
     r = set_me({"auto_captions": True})
-    check("PATCH to the default: full object, nothing stored", r.status_code == 200 and r.json() == {"auto_captions": True}
+    check("PATCH to the default: full object, nothing stored", r.status_code == 200 and r.json() == {"auto_captions": True, "captions_always": False}
           and stored() is None, (r.text, stored()))
     r = set_me({"auto_captions": False})
-    check("PATCH false returns the full object", r.status_code == 200 and r.json() == {"auto_captions": False}, r.text)
-    check("GET reflects it", me().json() == {"auto_captions": False})
+    check("PATCH false returns the full object", r.status_code == 200 and r.json() == {"auto_captions": False, "captions_always": False}, r.text)
+    check("GET reflects it", me().json() == {"auto_captions": False, "captions_always": False})
     check("stored per person id, only non-defaults", stored() == {A: {"auto_captions": False}}, stored())
-    check("B still has the default", me("B").json() == {"auto_captions": True})
+    check("B still has the default", me("B").json() == {"auto_captions": True, "captions_always": False})
     check("no temp files left", sorted(p.name for p in DATA.iterdir() if p.name.startswith(".")) == [],
           list(DATA.iterdir()))
     r = set_me({"auto_captions": True})
-    check("PATCH back to true", r.json() == {"auto_captions": True} and stored() == {}, stored())
+    check("PATCH back to true", r.json() == {"auto_captions": True, "captions_always": False} and stored() == {}, stored())
     r = set_me({"auto_captions": False, "extra": 1})
-    check("unknown fields beside auto_captions are ignored", r.status_code == 200 and r.json() == {"auto_captions": False}
+    check("unknown fields beside auto_captions are ignored", r.status_code == 200 and r.json() == {"auto_captions": False, "captions_always": False}
           and stored() == {A: {"auto_captions": False}}, (r.text, stored()))
 
     # --- TVs: A has LR; A and B both have DEN
@@ -276,7 +276,7 @@ with TestClient(main.app) as c:
     check("bad id: title/channel null", tv()["title"] is None)
 
     # --- speed with auto_captions false (A): only the speed
-    check("A's auto_captions is off", me().json() == {"auto_captions": False})
+    check("A's auto_captions is off", me().json() == {"auto_captions": False, "captions_always": False})
     play(LR, V1)
     LR.api.sent.clear()
     r = speed(1.5)
@@ -338,20 +338,79 @@ with TestClient(main.app) as c:
           and LR.api.sent == [{"languageCode": "en", "videoId": V4}] and LR.want_captions is True, (r.text, LR.api.sent))
     set_me({"auto_captions": False})
 
+    # --- captions_always: exclusive with auto_captions, 422s, storage
+    def S(auto, always): return {"auto_captions": auto, "captions_always": always}
+    for body in ({"auto_captions": True, "captions_always": True}, {"captions_always": None},
+                 {"captions_always": "true"}, {"captions_always": 1}, {"auto_captions": False, "captions_always": None}):
+        r = set_me(body)
+        check(f"PATCH {body!r} is 422", r.status_code == 422, (r.status_code, r.text))
+    check("refused captions_always PATCHes changed nothing", me().json() == S(False, False)
+          and stored() == {A: {"auto_captions": False}}, (me().text, stored()))
+    r = set_me({"auto_captions": True})
+    r = set_me({"captions_always": True})
+    check("captions_always on turns auto_captions off", r.status_code == 200 and r.json() == S(False, True), r.text)
+    check("  stored as non-defaults", stored() == {A: {"auto_captions": False, "captions_always": True}}, stored())
+    r = set_me({"auto_captions": True})
+    check("auto_captions on turns captions_always off", r.json() == S(True, False) and stored() == {}, (r.text, stored()))
+    r = set_me({"captions_always": True})
+    r = set_me({"captions_always": False})
+    check("captions_always off alone leaves auto_captions off", r.json() == S(False, False)
+          and stored() == {A: {"auto_captions": False}}, (r.text, stored()))
+    r = set_me({"auto_captions": False, "captions_always": True})
+    check("both in one PATCH, one on", r.json() == S(False, True), r.text)
+    r = set_me({"auto_captions": False})
+    check("auto_captions off leaves captions_always on", r.json() == S(False, True), r.text)
+    check("B unaffected", me("B").json() == S(True, False))
+
+    # --- captions_always: every new video gets captions on, speed doesn't touch them
+    V6, V7, V8 = "ffffffffff6", "gggggggggg7", "hhhhhhhhhh8"
+    LR.api.sent.clear()
+    want = LR.want_captions
+    r = speed(1.5)
+    check("always: speed sends no caption command", r.status_code == 200 and LR.api.sent == []
+          and LR.want_captions is want, LR.api.sent)
+    LR._captions_changed.clear(); play(LR, V6)
+    check("always: a new video gets captions on", LR.api.sent == [{"languageCode": "en", "videoId": V6}], LR.api.sent)
+    check("  and the TV confirms it", wait_for(LR._captions_changed.is_set) and LR.captions is True)
+    r = caps("off")
+    check("always: manual off works for this video", r.status_code == 200 and r.json()["captions"] is False
+          and LR.api.sent[-1] == {"videoId": V6}, (r.text, LR.api.sent))
+    n = len(LR.api.sent)
+    play(LR, V6)
+    check("always: the same video isn't turned back on", len(LR.api.sent) == n, LR.api.sent)
+    r = speed(1.0)
+    check("always: speed 1 sends nothing", len(LR.api.sent) == n and r.json()["captions"] is False, LR.api.sent)
+    LR._captions_changed.clear(); play(LR, V7)
+    check("always: the next video gets them on again", LR.api.sent[-1] == {"languageCode": "en", "videoId": V7},
+          LR.api.sent)
+    check("  and the TV confirms it", wait_for(LR._captions_changed.is_set) and LR.captions is True)
+    BDEN.api.sent.clear(); BDEN.want_captions = None
+    play(BDEN, V8)
+    check("always is the owner's: B's copy of the shared TV gets nothing", BDEN.api.sent == [], BDEN.api.sent)
+    set_me({"captions_always": False})
+
 # ---------- restart: settings reloaded
 main.devices.clear()
 (DATA / "settings.json").write_text(json.dumps({A: {"auto_captions": False}, B: {"auto_captions": True},
                                                 "": {"auto_captions": False}, "x": "junk",
                                                 "y": {"auto_captions": "no", "other": 1}}))
 with TestClient(main.app) as c:
-    check("restart: stored setting reloaded", c.get("/me/settings", headers=H("A")).json() == {"auto_captions": False})
+    check("restart: stored setting reloaded", c.get("/me/settings", headers=H("A")).json() == {"auto_captions": False, "captions_always": False})
     check("restart: default values and junk dropped on load", main.settings == {A: {"auto_captions": False}}, main.settings)
-    check("restart: B default", c.get("/me/settings", headers=H("B")).json() == {"auto_captions": True})
+    check("restart: B default", c.get("/me/settings", headers=H("B")).json() == {"auto_captions": True, "captions_always": False})
+main.devices.clear()
+(DATA / "settings.json").write_text(json.dumps({A: {"captions_always": True},
+                                                B: {"auto_captions": True, "captions_always": True}}))
+with TestClient(main.app) as c:
+    check("restart: captions_always reloaded", c.get("/me/settings", headers=H("A")).json() == {
+        "auto_captions": False, "captions_always": True})
+    check("restart: hand-edited both on reads as captions_always only", c.get("/me/settings", headers=H("B")).json() == {
+        "auto_captions": False, "captions_always": True})
 main.devices.clear()
 (DATA / "settings.json").write_text("{not json")
 with TestClient(main.app) as c:
     check("unreadable settings.json: defaults, still starts", c.get("/me/settings", headers=H("A")).json() == {
-        "auto_captions": True})
+        "auto_captions": True, "captions_always": False})
 
 # ---------- the real fetcher against a local fake oEmbed server (never YouTube)
 async def real_fetcher():

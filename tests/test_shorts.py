@@ -1,4 +1,4 @@
-"""A Short plays at 1x with captions off, and nothing is restored after it.
+"""A Short plays at 1x with captions off, and nothing is restored after it (except captions, with captions_always).
 
     python -I tests/test_shorts.py [repo]
 """
@@ -94,6 +94,24 @@ async def run():
     await d._auto_caption()
     check("nothing restored after it: still 1x", d.speed == 1.0 and ("speed", 1.5) not in tv.sent, tv.sent)
     check("and captions stay off", d.want_captions is False and ("cc", "en") not in tv.sent, tv.sent)
+
+    # The owner's captions_always: the Short is still reset, the next regular video gets captions on.
+    await settle()  # the TV's answers to the commands above land first
+    main.settings["owner-1"] = {"auto_captions": False, "captions_always": True}
+    d.speed, d.want_captions = 1.5, True
+    d.video_id = SHORT
+    await settle()
+    tv.sent.clear()
+    await d._auto_caption()
+    check("captions_always: the Short is still reset", d.speed == 1.0 and d.captions is False and tv.sent == [],
+          (d.speed, d.captions, tv.sent))
+    d.video_id = LONG
+    await settle()
+    await d._auto_caption()
+    await settle()
+    check("captions_always: the next video gets captions on", ("cc", "en") in tv.sent and d.captions is True,
+          (tv.sent, d.captions))
+    main.settings.clear()
 
     tv.sent.clear()
     d.video_id = SHORT
