@@ -109,6 +109,11 @@ import live_push
 import oembed
 import shorts
 
+# How our remote appears on the TV ("Canopy Control connected"). iSponsorBlockTV joins under its own
+# name (isbtv.DEFAULT_JOIN_NAME), so the two can be told apart there. Display only: the remote id
+# comes from lounge.LoungeApi.remote_id.
+REMOTE_NAME = "Canopy Control"
+
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 DEVICES_FILE = DATA / "devices.json"
 SETTINGS_FILE = DATA / "settings.json"
@@ -154,7 +159,7 @@ class Device(EventListener):
         self.name = name  # what the TV calls itself
         self.custom_name = custom_name  # what its owner renamed it to, if they did
         self.skip_sponsors = skip_sponsors  # its owner wants iSponsorBlockTV on it
-        self.api = LoungeApi("Speed Remote", self, owner)  # its own remote id: see lounge.py
+        self.api = LoungeApi(REMOTE_NAME, self, owner)  # its own remote id: see lounge.py
         # whether the TV's YouTube app is in the Lounge session (see _note_lounge_status)
         self._tv_in_session: bool | None = None  # None: no loungeStatus since the last connect
         self._session_remotes: list[str] = []  # the other devices in it: "name (type)"
@@ -1032,7 +1037,7 @@ async def add_skip_tv(body: Pair, person: dict = Depends(require_person)):
     owner = person["id"]
     # Only far enough to learn the screen id and name: pyytlounge's pair() is one POST to
     # /pairing/get_screen. No connect(), so no remote or Lounge session is left behind.
-    api = LoungeApi("Speed Remote", None, owner)
+    api = LoungeApi(REMOTE_NAME, None, owner)
     await api.__aenter__()
     screen_id = name = None
     try:

@@ -145,7 +145,7 @@ UPSTREAM_KEYS = {"devices", "skip_categories", "skip_count_tracking", "mute_ads"
                  "minimum_skip_length", "auto_play", "join_name", "apikey", "channel_whitelist", "use_proxy"}
 DEFAULTS = {"skip_categories": ["sponsor", "selfpromo", "music_offtopic"], "skip_count_tracking": True,
             "mute_ads": False, "skip_ads": True, "minimum_skip_length": 1, "auto_play": False,
-            "join_name": "Canopy Control", "apikey": "", "channel_whitelist": [], "use_proxy": False}
+            "join_name": "iSponsorBlockTV", "apikey": "", "channel_whitelist": [], "use_proxy": False}
 
 
 def conf(): return json.loads(CONF.read_text())

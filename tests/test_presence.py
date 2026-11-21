@@ -39,8 +39,8 @@ main.log.addHandler(cap)
 
 TV = {"app": "lb-v4", "name": "Bedroom TV", "id": "tv-device-id", "type": "LOUNGE_SCREEN",
       "deviceInfo": json.dumps({"clientName": "tvhtml5"})}
-US = {"app": "web", "name": "Speed Remote", "id": "remote-id-1", "type": "REMOTE_CONTROL"}
-ISB = {"app": "web", "name": "Canopy Control", "id": "remote-id-2", "type": "REMOTE_CONTROL"}
+US = {"app": "web", "name": "Canopy Control", "id": "remote-id-1", "type": "REMOTE_CONTROL"}
+ISB = {"app": "web", "name": "iSponsorBlockTV", "id": "remote-id-2", "type": "REMOTE_CONTROL"}
 
 
 def status(*devices):
@@ -83,8 +83,8 @@ async def run():
                                         status(TV, US, ISB), status(TV, US)])
     check("present at connect, then only changes", cap.lines == [
         "Bedroom TV: YouTube app in the session",
-        "Bedroom TV: YouTube app NOT in the session (only remotes: Speed Remote (REMOTE_CONTROL), "
-        "Canopy Control (REMOTE_CONTROL))",
+        "Bedroom TV: YouTube app NOT in the session (only remotes: Canopy Control (REMOTE_CONTROL), "
+        "iSponsorBlockTV (REMOTE_CONTROL))",
         "Bedroom TV: YouTube app in the session",
     ], cap.lines)
     check("no ids in the log", not any("remote-id" in l or "tv-device-id" in l for l in cap.lines), cap.lines)
@@ -95,7 +95,7 @@ async def run():
     cap.lines.clear()
     await session(d, [status(US)], [status(US)])
     check("absent at connect is logged", cap.lines == [
-        "Living Room TV: YouTube app NOT in the session (only remotes: Speed Remote (REMOTE_CONTROL))",
+        "Living Room TV: YouTube app NOT in the session (only remotes: Canopy Control (REMOTE_CONTROL))",
     ], cap.lines)
 
     # No loungeStatus in the connect: unknown, then the first one counts as a change.
@@ -112,7 +112,7 @@ async def run():
     cap.lines.clear()
     d._note_lounge_status({"devices": [US]})  # already a list, not a string
     check("a list instead of a JSON string works", d._tv_in_session is False and d._session_remotes ==
-          ["Speed Remote (REMOTE_CONTROL)"], d._session_remotes)
+          ["Canopy Control (REMOTE_CONTROL)"], d._session_remotes)
     check("nothing logged before a connect", cap.lines == [], cap.lines)
 
 

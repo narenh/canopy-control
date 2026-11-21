@@ -38,7 +38,7 @@ services:
       MUTE_ADS: ${MUTE_ADS:-false}
       AUTO_PLAY: ${AUTO_PLAY:-false}
       SKIP_MINIMUM_LENGTH: ${SKIP_MINIMUM_LENGTH:-1}
-      SKIP_JOIN_NAME: ${SKIP_JOIN_NAME:-Canopy Control}
+      SKIP_JOIN_NAME: ${SKIP_JOIN_NAME:-iSponsorBlockTV}
       SKIP_COUNT_TRACKING: ${SKIP_COUNT_TRACKING:-true}
     volumes:
       - api-data:/data

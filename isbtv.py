@@ -12,7 +12,7 @@ Settings, in iSponsorBlockTV's own key names (its src/iSponsorBlockTV/helpers.py
 SKIP_CATEGORIES -> skip_categories (comma-separated; default sponsor,selfpromo,music_offtopic),
 SKIP_ADS -> skip_ads (default true), MUTE_ADS -> mute_ads (false), AUTO_PLAY -> auto_play (false),
 SKIP_MINIMUM_LENGTH -> minimum_skip_length (seconds, default 1), SKIP_JOIN_NAME -> join_name (the
-name shown on the TV, default "Canopy Control"), SKIP_COUNT_TRACKING -> skip_count_tracking
+name shown on the TV, default "iSponsorBlockTV"), SKIP_COUNT_TRACKING -> skip_count_tracking
 (default true). apikey is "" and channel_whitelist is [] (a whitelist needs a YouTube API key).
 SKIP_HIDDEN_PERSON_IDS: comma-separated Canopy person ids who never see or get the feature.
 SKIP_TVS_LIMIT (default 5): how many Sponsor Block only TVs (skip_tvs.json) one person may have;
@@ -27,7 +27,7 @@ log = logging.getLogger("isbtv")
 KNOWN_CATEGORIES = {"sponsor", "selfpromo", "intro", "outro", "music_offtopic", "interaction",
                     "exclusive_access", "preview", "filler", "hook"}
 DEFAULT_CATEGORIES = "sponsor,selfpromo,music_offtopic"
-DEFAULT_JOIN_NAME = "Canopy Control"
+DEFAULT_JOIN_NAME = "iSponsorBlockTV"
 DEFAULT_SKIP_TVS_LIMIT = 5
 TRUE, FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
 
